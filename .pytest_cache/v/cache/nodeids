@@ -1,7 +1,0 @@
-[
-  "tests/test_reliability.py::test_deadlock_cycle_detected",
-  "tests/test_reliability.py::test_deadlock_detector_recovery",
-  "tests/test_reliability.py::test_live_lock_not_reaped",
-  "tests/test_reliability.py::test_no_deadlock_no_cycle",
-  "tests/test_reliability.py::test_stale_lock_reaped"
-]
