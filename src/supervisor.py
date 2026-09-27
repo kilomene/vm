@@ -137,6 +137,13 @@ class Supervisor:
             if time.time() - self._start_ts < 60:
                 return "ok", "starting"
             return "hung", "no heartbeat ever received"
+        # Phase 70: an unreliable clock invalidates heartbeat freshness —
+        # fail closed instead of trusting stale-but-"fresh" beats.
+        from . import timecheck as timecheckmod
+        if not timecheckmod.lease_valid(hb["ts"], max_age_s=None,
+                                        check_clock=True):
+            return "hung", ("clock unreliable: heartbeat freshness cannot "
+                            "be verified (fail-closed)")
         stale_s = time.time() - hb["ts"]
         if stale_s > self.cfg["heartbeat_timeout_s"]:
             # stale heartbeat: hang only if also no task progress
@@ -174,8 +181,25 @@ class Supervisor:
             self.store.journal("SAFE_MODE_ACTIVE_AT_BOOT")
         self.start_agent()
         last_hb = 0
+        last_clock_check = 0
         while not self._shutdown:
             state, detail = self.agent_health()
+            # Phase 70: time synchronization — fail closed on unreliable
+            # clocks, since heartbeats/leases are meaningless without time.
+            if time.time() - last_clock_check > 60:
+                last_clock_check = time.time()
+                from . import timecheck as timecheckmod
+                clock_ok, clock_detail = timecheckmod.check_sync()
+                self.store.world_set("supervisor.clock", {
+                    "ok": clock_ok, "detail": clock_detail,
+                    "checked_at": time.time()}, verifier="supervisor:time")
+                if not clock_ok:
+                    self.store.journal(
+                        "CLOCK_UNRELIABLE",
+                        detail=clock_detail,
+                        action="safe mode (fail-closed)")
+                    self.recovery.enter_safe_mode(
+                        None, f"clock unreliable: {clock_detail}")
             if state == "crashed":
                 self.store.journal("AGENT_CRASHED", detail=detail)
                 if not self.restart_agent(f"crash: {detail}"):
