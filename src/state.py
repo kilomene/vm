@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     label TEXT NOT NULL,
     state_json TEXT NOT NULL,
     config_json TEXT,
+    content_sha256 TEXT,
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS world_state (
@@ -138,6 +139,88 @@ CREATE TABLE IF NOT EXISTS audit (
     result TEXT,                       -- ok|failed|refused
     verified TEXT                       -- PASS|FAIL|N/A
 );
+-- Phase 51-90: advanced reliability layer
+CREATE TABLE IF NOT EXISTS recovery_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    task_id TEXT,
+    failure_kind TEXT NOT NULL,        -- e.g. worker_crash
+    failure_signature TEXT NOT NULL,   -- fingerprint (phase 56)
+    recovery_method TEXT NOT NULL,     -- e.g. restart_worker
+    level INTEGER,                     -- escalation level used
+    result TEXT NOT NULL,              -- ok|failed
+    detail TEXT
+);
+CREATE TABLE IF NOT EXISTS failure_fingerprints (
+    signature TEXT PRIMARY KEY,
+    task_id TEXT,
+    kind TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    last_method TEXT,
+    escalated INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS resource_owners (
+    resource_id TEXT PRIMARY KEY,      -- e.g. "port:8765", "file:/tmp/x"
+    kind TEXT NOT NULL,                -- port|file|process|tmpdir|browser_session|deployment|external_job
+    task_id TEXT,
+    execution_id TEXT,
+    owner TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    lease_expires_at REAL,
+    state TEXT NOT NULL DEFAULT 'active',  -- active|released|stale
+    meta TEXT
+);
+CREATE TABLE IF NOT EXISTS external_resources (
+    resource_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    creation_op TEXT,
+    known_state TEXT NOT NULL DEFAULT 'UNKNOWN',  -- SUCCESS|FAILED|PENDING|UNKNOWN
+    last_verified REAL,
+    meta TEXT
+);
+CREATE TABLE IF NOT EXISTS capabilities (
+    task_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    granted_by TEXT NOT NULL DEFAULT 'scheduler',
+    granted_at REAL NOT NULL,
+    expires_at REAL,
+    PRIMARY KEY (task_id, capability)
+);
+CREATE TABLE IF NOT EXISTS config_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_path TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    content TEXT NOT NULL,
+    is_known_good INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS backups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    path TEXT NOT NULL,
+    includes_json TEXT NOT NULL,
+    manifest_sha256 TEXT,
+    restored_ok INTEGER,               -- NULL=never tested, 0=failed, 1=passed
+    restored_at REAL
+);
+CREATE TABLE IF NOT EXISTS executions (
+    execution_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    status TEXT NOT NULL DEFAULT 'RUNNING'  -- RUNNING|DONE|ABANDONED
+);
+CREATE TABLE IF NOT EXISTS migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at REAL NOT NULL,
+    note TEXT
+);
 """
 
 _lock = threading.RLock()  # RLock: journal() is called from methods
@@ -154,7 +237,21 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with _lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self):
+        """Column-level migrations for DBs created before a schema change."""
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(capabilities)")}
+        if "expires_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE capabilities ADD COLUMN expires_at REAL")
+        scols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(snapshots)")}
+        if "content_sha256" not in scols:
+            self._conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN content_sha256 TEXT")
 
     # ---- tasks ----
     def create_task(self, task_id, spec, working_directory=None):
@@ -211,6 +308,23 @@ class Store:
                 "SELECT * FROM checkpoints WHERE task_id=? ORDER BY step DESC LIMIT 1",
                 (task_id,)).fetchone()
         return dict(row) if row else None
+
+    def checkpoints(self, task_id):
+        """All checkpoints for a task, oldest first (phase 67: the chain
+        request_resume verifies before allowing a resume)."""
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT * FROM checkpoints WHERE task_id=? ORDER BY step ASC",
+                (task_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_checkpoints(self, task_id):
+        """Delete all checkpoints for a task. Used by tests/fault injection
+        to model a crash that happened before the checkpoint was written."""
+        with _lock:
+            self._conn.execute(
+                "DELETE FROM checkpoints WHERE task_id=?", (task_id,))
+            self._conn.commit()
 
     # ---- heartbeats ----
     def heartbeat(self, component, pid=None, task_id=None, step=None,
@@ -428,7 +542,7 @@ class Store:
                 " ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
 
-    # ---- snapshots (phase 47) ----
+    # ---- snapshots (phase 47/67) ----
     def snapshot(self, task_id, label, state, config=None):
         with _lock:
             cur = self._conn.execute(
@@ -438,6 +552,34 @@ class Store:
                  json.dumps(config) if config else None, time.time()))
             self._conn.commit()
             return cur.lastrowid
+
+    def snapshot_save(self, task_id, label, state_blob, content_sha256=None):
+        """Phase 67: content-hashed resumable snapshot. state_blob is the
+        canonical JSON string (hash computed over exactly this)."""
+        with _lock:
+            cur = self._conn.execute(
+                "INSERT INTO snapshots (task_id, label, state_json,"
+                " content_sha256, created_at) VALUES (?,?,?,?,?)",
+                (task_id, label, state_blob, content_sha256, time.time()))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def snapshot_verify(self, snapshot_id):
+        """Phase 67: verify a snapshot's content hash. Returns (ok, reason)."""
+        import hashlib as _h
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM snapshots WHERE id=?",
+                (snapshot_id,)).fetchone()
+        if not row:
+            return False, "snapshot not found"
+        d = dict(row)
+        if not d.get("content_sha256"):
+            return True, "no hash recorded (legacy snapshot)"
+        actual = _h.sha256(d["state_json"].encode()).hexdigest()
+        if actual != d["content_sha256"]:
+            return False, "content hash mismatch: snapshot corrupted"
+        return True, "hash verified"
 
     def latest_snapshot(self, task_id, label=None):
         with _lock:
@@ -538,10 +680,372 @@ class Store:
                  result, verified))
             self._conn.commit()
 
+    # ---- recovery attempts + failure fingerprints (phases 55/56) ----
+    def recovery_record(self, task_id, failure_kind, signature, method,
+                        level=None, result="ok", detail=None):
+        now = time.time()
+        with _lock:
+            self._conn.execute(
+                "INSERT INTO recovery_attempts (ts, task_id, failure_kind,"
+                " failure_signature, recovery_method, level, result, detail)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (now, task_id, failure_kind, signature, method, level,
+                 result, detail))
+            row = self._conn.execute(
+                "SELECT occurrences FROM failure_fingerprints WHERE signature=?",
+                (signature,)).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE failure_fingerprints SET last_seen=?,"
+                    " occurrences=occurrences+1, last_method=? WHERE signature=?",
+                    (now, method, signature))
+            else:
+                self._conn.execute(
+                    "INSERT INTO failure_fingerprints (signature, task_id, kind,"
+                    " first_seen, last_seen, occurrences, last_method)"
+                    " VALUES (?,?,?,?,?,1,?)",
+                    (signature, task_id, failure_kind, now, now, method))
+            self._conn.commit()
+        self.journal("RECOVERY_RECORDED", task_id=task_id,
+                     failure=failure_kind, method=method, result=result)
+
+    def recoveries_list(self, task_id=None, limit=20):
+        """Phase 55: recent recovery attempts, newest first."""
+        with _lock:
+            q = "SELECT * FROM recovery_attempts"
+            args = []
+            if task_id:
+                q += " WHERE task_id=?"
+                args.append(task_id)
+            q += " ORDER BY id DESC LIMIT ?"
+            args.append(limit)
+            rows = self._conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def task_recoveries(self, task_id, limit=20):
+        """Phase 55: recovery history for one task (alias)."""
+        return self.recoveries_list(task_id=task_id, limit=limit)
+
+    def failure_signatures(self, task_id=None, limit=50):
+        """Phase 56: known failure fingerprints, most frequent first."""
+        with _lock:
+            q = "SELECT * FROM failure_fingerprints"
+            args = []
+            if task_id:
+                q += " WHERE task_id=?"
+                args.append(task_id)
+            q += " ORDER BY occurrences DESC LIMIT ?"
+            args.append(limit)
+            rows = self._conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def recovery_history(self, signature=None, task_id=None, limit=20):
+        with _lock:
+            q = "SELECT * FROM recovery_attempts"
+            conds, args = [], []
+            if signature:
+                conds.append("failure_signature=?"); args.append(signature)
+            if task_id:
+                conds.append("task_id=?"); args.append(task_id)
+            if conds:
+                q += " WHERE " + " AND ".join(conds)
+            q += " ORDER BY id DESC LIMIT ?"
+            args.append(limit)
+            rows = self._conn.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def same_method_failed(self, signature, method):
+        """True if this exact method already failed for this signature —
+        don't repeat a known-unsuccessful strategy."""
+        with _lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) c FROM recovery_attempts"
+                " WHERE failure_signature=? AND recovery_method=?"
+                " AND result='failed'", (signature, method)).fetchone()
+        return row["c"] > 0
+
+    def fingerprint_get(self, signature):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM failure_fingerprints WHERE signature=?",
+                (signature,)).fetchone()
+        return dict(row) if row else None
+
+    def fingerprint_escalate(self, signature):
+        with _lock:
+            self._conn.execute(
+                "UPDATE failure_fingerprints SET escalated=1 WHERE signature=?",
+                (signature,))
+            self._conn.commit()
+        self.journal("FAILURE_ESCALATED", signature=signature)
+
+    # ---- resource ownership (phases 58/85/86/87) ----
+    def resource_acquire(self, resource_id, kind, owner, task_id=None,
+                         execution_id=None, ttl_s=None, meta=None):
+        now = time.time()
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM resource_owners WHERE resource_id=?",
+                (resource_id,)).fetchone()
+            if row and row["state"] == "active" and row["owner"] != owner:
+                exp = row["lease_expires_at"]
+                if exp is None or exp > now:
+                    return False  # owned by someone else
+            self._conn.execute(
+                "INSERT OR REPLACE INTO resource_owners (resource_id, kind,"
+                " task_id, execution_id, owner, acquired_at, lease_expires_at,"
+                " state, meta) VALUES (?,?,?,?,?,?,?,?,?)",
+                (resource_id, kind, task_id, execution_id, owner, now,
+                 (now + ttl_s) if ttl_s else None, "active",
+                 json.dumps(meta) if meta else None))
+            self._conn.commit()
+        return True
+
+    def resource_release(self, resource_id, owner=None):
+        with _lock:
+            if owner:
+                self._conn.execute(
+                    "UPDATE resource_owners SET state='released'"
+                    " WHERE resource_id=? AND owner=?",
+                    (resource_id, owner))
+            else:
+                self._conn.execute(
+                    "UPDATE resource_owners SET state='released'"
+                    " WHERE resource_id=?", (resource_id,))
+            self._conn.commit()
+
+    def resource_get(self, resource_id):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM resource_owners WHERE resource_id=?",
+                (resource_id,)).fetchone()
+        return dict(row) if row else None
+
+    def resource_owned_by(self, resource_id, owner):
+        r = self.resource_get(resource_id)
+        return bool(r and r["state"] == "active" and r["owner"] == owner)
+
+    def resources_for_task(self, task_id, active_only=True):
+        with _lock:
+            q = "SELECT * FROM resource_owners WHERE task_id=?"
+            if active_only:
+                q += " AND state='active'"
+            rows = self._conn.execute(q, (task_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resource_sweep_stale(self):
+        """Mark expired resources owned by dead processes as stale."""
+        now = time.time()
+        stale = []
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT * FROM resource_owners WHERE state='active'"
+                " AND lease_expires_at IS NOT NULL"
+                " AND lease_expires_at < ?", (now,)).fetchall()
+            for row in rows:
+                pid = _owner_pid_row(row["owner"])
+                if not _pid_alive(pid):
+                    self._conn.execute(
+                        "UPDATE resource_owners SET state='stale'"
+                        " WHERE resource_id=?", (row["resource_id"],))
+                    stale.append(row["resource_id"])
+            self._conn.commit()
+        for rid in stale:
+            self.journal("RESOURCE_STALE", resource_id=rid)
+        return stale
+
+    # ---- external resources (phase 63) ----
+    def ext_resource_register(self, resource_id, kind, task_id, creation_op,
+                              meta=None):
+        with _lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO external_resources (resource_id, kind,"
+                " task_id, creation_op, known_state, last_verified, meta)"
+                " VALUES (?,?,?,?, 'UNKNOWN', ?, ?)",
+                (resource_id, kind, task_id, creation_op, time.time(),
+                 json.dumps(meta) if meta else None))
+            self._conn.commit()
+
+    def ext_resource_update(self, resource_id, known_state, meta=None):
+        with _lock:
+            self._conn.execute(
+                "UPDATE external_resources SET known_state=?, last_verified=?,"
+                " meta=COALESCE(?, meta) WHERE resource_id=?",
+                (known_state, time.time(),
+                 json.dumps(meta) if meta else None, resource_id))
+            self._conn.commit()
+
+    def ext_resource_get(self, resource_id):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM external_resources WHERE resource_id=?",
+                (resource_id,)).fetchone()
+        return dict(row) if row else None
+
+    def ext_resources_pending(self):
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT * FROM external_resources WHERE known_state IN"
+                " ('PENDING','UNKNOWN')").fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- capabilities (phase 59) ----
+    def capability_grant(self, task_id, capability, granted_by="scheduler",
+                         ttl_s=None):
+        now = time.time()
+        expires = (now + ttl_s) if ttl_s is not None else None
+        with _lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO capabilities (task_id, capability,"
+                " granted_by, granted_at, expires_at) VALUES (?,?,?,?,?)",
+                (task_id, capability, granted_by, now, expires))
+            self._conn.commit()
+
+    def capability_revoke(self, task_id, capability):
+        with _lock:
+            self._conn.execute(
+                "DELETE FROM capabilities WHERE task_id=? AND capability=?",
+                (task_id, capability))
+            self._conn.commit()
+
+    def capabilities_for(self, task_id):
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT capability FROM capabilities WHERE task_id=?",
+                (task_id,)).fetchall()
+        return {r["capability"] for r in rows}
+
+    def capability_has(self, task_id, capability):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT expires_at FROM capabilities WHERE task_id=? AND"
+                " capability=?", (task_id, capability)).fetchone()
+        if not row:
+            return False
+        exp = row["expires_at"]
+        if exp is not None and time.time() >= exp:
+            # expired: clean up lazily
+            with _lock:
+                self._conn.execute(
+                    "DELETE FROM capabilities WHERE task_id=? AND"
+                    " capability=?", (task_id, capability))
+                self._conn.commit()
+            return False
+        return True
+
+    # ---- config versions (phase 61) ----
+    def config_version_save(self, config_path, content, note="",
+                            known_good=False):
+        import hashlib as _h
+        digest = _h.sha256(content.encode()).hexdigest()
+        with _lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) v FROM config_versions WHERE config_path=?",
+                (config_path,)).fetchone()
+            ver = (row["v"] or 0) + 1
+            cur = self._conn.execute(
+                "INSERT INTO config_versions (config_path, version, sha256,"
+                " content, is_known_good, created_at, note)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (config_path, ver, digest, content,
+                 1 if known_good else 0, time.time(), note))
+            if known_good:
+                self._conn.execute(
+                    "UPDATE config_versions SET is_known_good=0"
+                    " WHERE config_path=? AND id<>?",
+                    (config_path, cur.lastrowid))
+            self._conn.commit()
+            return ver
+
+    def config_last_known_good(self, config_path):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM config_versions WHERE config_path=?"
+                " AND is_known_good=1 ORDER BY version DESC LIMIT 1",
+                (config_path,)).fetchone()
+        return dict(row) if row else None
+
+    def config_versions(self, config_path, limit=10):
+        """Phase 61: version history for a config file, newest first."""
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT * FROM config_versions WHERE config_path=?"
+                " ORDER BY version DESC LIMIT ?",
+                (config_path, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- backups (phase 76) ----
+    def backup_record(self, label, path, includes, manifest_sha256=None):
+        with _lock:
+            cur = self._conn.execute(
+                "INSERT INTO backups (label, created_at, path, includes_json,"
+                " manifest_sha256) VALUES (?,?,?,?,?)",
+                (label, time.time(), path, json.dumps(includes),
+                 manifest_sha256))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def backup_mark_restored(self, backup_id, ok):
+        with _lock:
+            self._conn.execute(
+                "UPDATE backups SET restored_ok=?, restored_at=? WHERE id=?",
+                (1 if ok else 0, time.time(), backup_id))
+            self._conn.commit()
+
+    def backups_list(self):
+        with _lock:
+            rows = self._conn.execute(
+                "SELECT * FROM backups ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- executions (phase 85) ----
+    def execution_begin(self, execution_id, task_id):
+        with _lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO executions (execution_id, task_id,"
+                " started_at, status) VALUES (?,?,?,'RUNNING')",
+                (execution_id, task_id, time.time()))
+            self._conn.commit()
+
+    def execution_end(self, execution_id, status="DONE"):
+        with _lock:
+            self._conn.execute(
+                "UPDATE executions SET ended_at=?, status=? WHERE execution_id=?",
+                (time.time(), status, execution_id))
+            self._conn.commit()
+
+    def execution_get(self, execution_id):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT * FROM executions WHERE execution_id=?",
+                (execution_id,)).fetchone()
+        return dict(row) if row else None
+
+    # ---- migrations (phase 74) ----
+    def migration_applied(self, version, note=""):
+        with _lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO migrations (version, applied_at, note)"
+                " VALUES (?,?,?)", (version, time.time(), note))
+            self._conn.commit()
+
+    def migration_version(self):
+        with _lock:
+            row = self._conn.execute(
+                "SELECT MAX(version) v FROM migrations").fetchone()
+        return row["v"] or 0
+
     def close(self):
         with _lock:
             self._conn.commit()
             self._conn.close()
+
+
+def _owner_pid_row(owner):
+    try:
+        return int(str(owner or "").rsplit(":", 1)[-1])
+    except (ValueError, AttributeError):
+        return 0
 
 
 def _pid_alive(pid):
