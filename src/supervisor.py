@@ -23,12 +23,15 @@ import traceback
 
 from . import config as config_mod
 from .state import Store
+from .recovery import RecoveryManager
 
 
 class Supervisor:
     def __init__(self, cfg):
         self.cfg = cfg
         self.store = Store(cfg["state_db"], cfg["journal_dir"])
+        self.recovery = RecoveryManager(self.store, cfg,
+                                        journal=self.store.journal)
         self.base = cfg["base_dir"]
         self.run_dir = cfg["run_dir"]
         os.makedirs(self.run_dir, exist_ok=True)
@@ -162,6 +165,13 @@ class Supervisor:
         self._start_ts = time.time()
         self.store.journal("SUPERVISOR_STARTED", pid=os.getpid())
         self.store.heartbeat("supervisor", pid=os.getpid(), status="alive")
+        # Phase 33: reconcile before the agent starts — stale locks, leases,
+        # RUNNING tasks from a dead agent, config integrity.
+        ctx = {"base_dir": self.base}
+        self.recovery.reconcile_on_boot(ctx)
+        # Phase 41: if we booted into safe mode, journal it loudly.
+        if self.recovery.in_safe_mode():
+            self.store.journal("SAFE_MODE_ACTIVE_AT_BOOT")
         self.start_agent()
         last_hb = 0
         while not self._shutdown:
