@@ -675,3 +675,19 @@ def test_config_mark_good_pins_version(store, tmp_path):
     integ.mark_config_good(store, base, paths=["config/config.json"])
     goods = store.config_versions(cfg_path, limit=5)
     assert any(g.get("is_known_good") for g in goods)
+
+
+def test_reconcile_on_boot_completes_no_crash(cfg):
+    # Regression (found on a real install 2026-09-27): reconcile_on_boot
+    # crashed the supervisor at boot with
+    # TypeError: getaddrinfo() got an unexpected keyword argument 'timeout'.
+    # The phase-3 suite never exercised this path live; it must complete.
+    from src import recovery as recmod
+    s = Store(cfg["state_db"], cfg["journal_dir"])
+    try:
+        r = recmod.RecoveryManager(s, cfg)
+        report = r.reconcile_on_boot({"base_dir": cfg["base_dir"]})
+        assert isinstance(report, dict)
+        assert "fixed" in report and "warnings" in report
+    finally:
+        s.close()
