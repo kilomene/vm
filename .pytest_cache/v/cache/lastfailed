@@ -1,8 +1,0 @@
-{
-  "tests/test_vm.py::test_supervisor_and_agent_up": true,
-  "tests/test_vm.py::test_task_completes_with_verification": true,
-  "tests/test_vm.py::test_verifier_rejects_bad_result": true,
-  "tests/test_vm.py::test_policy_blocks_protected": true,
-  "tests/test_vm.py::test_agent_crash_recovery": true,
-  "tests/test_vm.py::test_idempotent_resume": true
-}
