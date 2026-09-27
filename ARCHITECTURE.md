@@ -47,12 +47,45 @@ The runtime refuses PROTECTED without an out-of-band token (not implemented
 to auto-approve — refusal is the safe default).
 
 ### 6. State (`lib/vmagent/state.py`)
-SQLite tables: `tasks`, `checkpoints`, `heartbeats`, `kv` (world state),
-`restarts`. Plus an append-only JSONL event journal (`state/journal/`).
-Thread-safe via a lock; WAL not required at this scale.
+SQLite tables: `tasks`, `checkpoints`, `heartbeats`, `kv`,
+`locks`/`leases` (phase 27/32), `operations` op registry (30/31),
+`interventions` (46), `snapshots`/`world_state`/`model_claims` (34/35),
+`file_hashes` (45), `budgets` (39), `restarts`, `audit` (47).
+Plus an append-only JSONL event journal (`state/journal/`).
+Thread-safe via an RLock (journal is called from lock-holding methods).
 
 ### 7. CLI (`lib/vmagent/cli.py`)
-`vm-agent status|health|logs|tasks|submit|restart|diagnostics|recover`.
+`vm-agent status|health|logs|tasks|submit|restart|diagnostics|diagnose|
+recover|locks|interventions|world|task-pause|task-resume|task-cancel`.
+
+### 8. Reliability layer (phases 26–60)
+- `deps.py` — dependency self-checks + safe-repair-only healing (26)
+- `locks.py` — wait-graph deadlock detection + least-destructive recovery (27)
+- `txn.py` — transactional execution + idempotent op registry + UNKNOWN
+  reconcile (29/30/31)
+- `world.py` — verifier-only world state, separate model claims (34/35)
+- `model.py` — action schema validation, model failure retry/fallback,
+  context recovery (36/37/38)
+- `recovery.py` — L1–L8 escalation, safe mode, startup reconciliation (33/40/41)
+- `resources.py` — pressure sampling, log rotation, load shedding (42)
+- `net.py` — network failure classification + per-kind retry policy (43)
+- `browserx.py` — browser subsystem health + session recovery (44)
+- `integrity.py` — file integrity hashes + protected-config auth (45)
+- `remote.py` — localhost-only token-auth control API (50)
+
+## Data flow (one step)
+
+```
+spec step → op registry (skip if COMPLETED) → policy.classify
+    → budget check → executor.run → ToolResult
+                                          ↓
+                                verifier.verify_step → Verdict
+                                          ↓
+                          pass? → op COMPLETED → checkpoint → next step
+                          fail? → op FAILED → retry (backoff) → recovery L1..L8
+                          cancel? → STOPPING→CLEANUP→CHECKPOINT→CANCELLED
+                          shutdown? → PAUSED (resume later)
+```
 
 ## Data flow (one step)
 
