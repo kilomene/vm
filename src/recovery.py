@@ -1,4 +1,6 @@
 """Phase 40/41/33: escalating recovery manager, safe mode, startup reconciliation.
+Phases 55/56/79: recovery history, failure fingerprints, recovery matrix
+as runtime policy.
 
 Recovery levels (least destructive first):
   L1 retry operation
@@ -7,8 +9,8 @@ Recovery levels (least destructive first):
   L4 restart agent runtime
   L5 repair dependency
   L6 reload task state
-  L7 enter safe mode
-  L8 request human intervention
+  L7 safe mode
+  L8 human intervention
 
 Safe mode: preserve data, stop dangerous actions, keep logs/diagnostics,
 allow inspection, no repeated destructive retries.
@@ -36,6 +38,33 @@ LEVELS = {
     6: "reload task state",
     7: "safe mode",
     8: "human intervention",
+}
+
+# failure kind -> recovery action -> escalation level (phase 79 matrix hookup)
+ACTION_LEVEL = {
+    "retry_step": 1,
+    "retry_operation": 1,
+    "retry_model": 1,
+    "backoff_retry": 1,
+    "wait_reconnect": 1,
+    "reap_lock": 1,
+    "restart_worker": 2,
+    "release_stale": 2,
+    "restart_browser": 3,
+    "restore_session": 3,
+    "restart_agent": 4,
+    "repair_dep": 5,
+    "reinstall_dep": 5,
+    "restore_config": 5,
+    "fallback_model": 5,
+    "reload_task_state": 6,
+    "rebuild_plan": 6,
+    "restore_backup": 6,
+    "pause_task": 6,
+    "resume_task": 6,
+    "escalate_strategy": 7,
+    "safe_mode": 7,
+    "human": 8,
 }
 
 
@@ -74,21 +103,74 @@ class RecoveryManager:
             return 7
         return 8
 
-    def recover(self, task_id, kind, detail=None, agent=None):
-        """Choose and execute the lowest destructive level that fits."""
-        level = self.level_for(task_id, kind)
+    def recover(self, task_id, kind, detail=None, agent=None,
+                operation="", error_text=""):
+        """Phase 55/56/79: consult the recovery matrix + history before
+        acting. Never repeat a recovery method that already failed for
+        this failure fingerprint; escalate instead."""
+        from . import failure as failuremod
+        from . import matrix as matrixmod
+        # 1. matrix policy for this failure kind
+        entry = matrixmod.policy_for(kind)
+        action = entry["recovery"]
+        # 2. history: has this action already failed for this fingerprint?
+        method, sig, exhausted = failuremod.FailureAnalyzer(
+            self.store, self.journal).choose_strategy(
+                task_id, kind, operation or kind, error_text or str(detail))
+        if exhausted:
+            action = matrixmod.escalation_for(kind)
+            self.journal("RECOVERY_ESCALATED_HISTORY", task_id=task_id,
+                         kind=kind, signature=sig, action=action)
+        elif method != "retry_step" and method in ACTION_LEVEL:
+            # history suggests a different strategy than the matrix default
+            action = method
+        if action.startswith("none"):
+            # matrix actions like "none — open intervention": no automatic
+            # recovery exists; go straight to human escalation.
+            level = 8
+        else:
+            level = ACTION_LEVEL.get(action, self.level_for(task_id, kind))
+        # 3. hard retry limit from the matrix
+        if self._fail_counts.get((task_id, kind), 0) >= \
+                matrixmod.retry_limit_for(kind) and \
+                matrixmod.retry_limit_for(kind) > 0:
+            action = matrixmod.escalation_for(kind)
+            level = ACTION_LEVEL.get(action, 8)
+            self.journal("RECOVERY_RETRY_LIMIT", task_id=task_id, kind=kind,
+                         action=action)
         self.journal("RECOVERY_LEVEL", task_id=task_id, kind=kind,
-                     level=level, name=LEVELS[level], detail=detail)
+                     level=level, name=LEVELS[level], detail=detail,
+                     action=action, matrix=entry["recovery"])
+        # 4. persist the attempt (phase 55)
+        self.store.recovery_record(task_id, kind, sig, action, level=level,
+                                   result="ok" if level < 8 else "failed",
+                                   detail=str(detail)[:300])
+        # 5. explain the recovery (phase 88: recovery communication)
+        self._explain(task_id, kind, action, level, sig, detail)
         if level >= 7:
             self.enter_safe_mode(task_id, f"escalated to L{level}: {kind}")
         if level == 8 and agent is not None:
-            agent.pause_task(task_id, reason=f"L8: {kind}: {detail}")
+            # Phase 66: verified pause ("pause_task" is the strategy name in
+            # the matrix; the agent's verified API is request_pause).
+            agent.request_pause(task_id)
+            self.journal("TASK_PAUSED_L8", task_id=task_id,
+                         reason=f"L8: {kind}: {detail}")
             self.store.intervention_open(
                 task_id=task_id,
                 reason=f"automatic recovery exhausted for: {kind}",
                 required_action="human review required",
                 last_verified_step=str(detail)[:200])
         return level
+
+    def _explain(self, task_id, kind, action, level, signature, detail):
+        """Phase 88: every recovery is visible and self-explanatory."""
+        self.journal("RECOVERY_EXPLAINED", task_id=task_id,
+                     what_failed=kind,
+                     what_detected=f"failure fingerprint {signature}",
+                     what_attempted=f"L{level} {action} ({LEVELS[level]})",
+                     what_verified="pending: verified after execution",
+                     what_next=("escalate" if level >= 7
+                                else "resume on success"))
 
     # ---- safe mode (phase 41) ----
     def enter_safe_mode(self, task_id=None, reason=""):
