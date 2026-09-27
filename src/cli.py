@@ -237,6 +237,55 @@ def cmd_diagnose(args):
     print(f"Disk: {free // (1024**3)} GB free of {total // (1024**3)} GB")
     hour_ago = time.time() - 3600
     print(f"Restarts (last hour): {s.restart_count_since('agent', hour_ago)}")
+
+    # ---- Phase 83: comprehensive recovery-health diagnostics ----
+    print("\nRECOVERY HEALTH")
+    from . import matrix as matrixmod
+    print(f"Recovery matrix: {len(matrixmod.all_kinds())} failure kinds "
+          f"with detect->classify->recover->verify->limit->escalate")
+    recs = s.recoveries_list(limit=5)
+    print(f"Recent recovery attempts: {len(recs)} shown (of history)")
+    for r in recs:
+        print(f"  {r['task_id']}: {r['failure_kind']} -> "
+              f"{r['strategy']} = {r['result']}")
+    n_sigs = sum(len(s.failure_signatures(t["task_id"])) for t in tasks)
+    print(f"Failure fingerprints tracked: {n_sigs}")
+    n_proven = sum(1 for b in s.backups_list() if b["restored_ok"])
+    n_backups = len(s.backups_list())
+    print(f"Backups: {n_backups} total, {n_proven} proven by test-restore"
+          + ("  <-- WARNING: no proven backup" if n_backups and not n_proven
+             else ""))
+    stalled = [t for t in tasks if t["status"] == "STALLED"]
+    print(f"Stalled tasks: {len(stalled)}")
+    for t in stalled[:5]:
+        print(f"  {t['task_id']} at step {t['current_step']}")
+    print("Dependencies:")
+    try:
+        from . import deps as depsmod
+        for name, rec in depsmod.dep_status_all(s, {"base_dir": cfg["base_dir"]}).items():
+            if rec["health"] != "healthy":
+                print(f"  {name}: {rec['health']} "
+                      f"(installed={rec['installed_version']}, "
+                      f"required={rec['required_version']})")
+    except Exception as e:  # noqa: BLE001 - diagnostics must not fail
+        print(f"  (dep check failed: {e!r})")
+    try:
+        from . import timecheck as timecheckmod
+        ok, detail = timecheckmod.check_sync()
+        print(f"Clock: {'ok' if ok else 'UNRELIABLE'} "
+              f"{detail.get('reason', detail.get('method'))}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Clock: check failed ({e!r})")
+    # Phase 60: scan recent journal lines for accidental secret exposure.
+    try:
+        from . import secrets as secretsmod
+        hits = secretsmod.scan_journal(cfg["journal_dir"], days=1)
+        print(f"Secret exposure scan (journal, 24h): "
+              f"{'CLEAN' if not hits else f'{len(hits)} HITS — investigate'}")
+        for h in hits[:5]:
+            print(f"  {h}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Secret scan: failed ({e!r})")
     s.close()
 
 
@@ -275,6 +324,37 @@ def cmd_recover(args):
     # by asking a running agent, or runs it inline if none is up.
     cfg = _cfg()
     s = _store(cfg)
+    if getattr(args, "dry_run", False):
+        # Phase 84: show what recovery WOULD do, without doing anything.
+        from . import failure as failuremod
+        from . import matrix as matrixmod
+        analyzer = failuremod.FailureAnalyzer(s)
+        running = [t for t in s.list_tasks()
+                   if t["status"] in ("RUNNING", "PAUSED", "FAILED",
+                                      "STALLED")]
+        print(f"DRY RUN — no state mutated. {len(running)} task(s) need "
+              f"recovery:")
+        for t in running:
+            tid = t["task_id"]
+            sigs = s.failure_signatures(tid)
+            print(f"\n  {tid}: {t['status']} at step {t['current_step']}")
+            if not sigs:
+                print("    no recorded failures: would resume from "
+                      "checkpoint")
+                continue
+            for fs in sigs[:3]:
+                method, sig, exhausted = analyzer.choose_strategy(
+                    tid, fs["failure_kind"], fs["operation"], "")
+                entry = matrixmod.policy_for(fs["failure_kind"])
+                print(f"    failure '{fs['failure_kind']}' "
+                      f"(x{fs['occurrences']}):")
+                print(f"      matrix: {entry['detection']} -> "
+                      f"{entry['recovery']} -> {entry['verification']}")
+                print(f"      history: {fs['last_strategy']} tried "
+                      f"{fs['occurrences']}x, "
+                      f"{'EXHAUSTED -> escalate to ' + entry['escalation'] if exhausted else 'would try: ' + method}")
+        s.close()
+        return
     running = [t for t in s.list_tasks() if t["status"] in ("RUNNING", "PAUSED")]
     print(f"{len(running)} unfinished task(s):")
     for t in running:
@@ -283,6 +363,75 @@ def cmd_recover(args):
               f"last checkpoint: {ck['label'] if ck else 'none'}")
     print("unfinished tasks resume automatically when the agent (re)starts.")
     s.close()
+
+
+def cmd_matrix(args):
+    """Phase 79: display the recovery matrix (runtime policy)."""
+    from . import matrix as matrixmod
+    kinds = matrixmod.all_kinds()
+    filt = getattr(args, "kind", None)
+    if filt:
+        kinds = [k for k in kinds if filt in k]
+    for k in kinds:
+        e = matrixmod.policy_for(k)
+        print(f"== {k}")
+        print(f"   detect:    {e['detection']}")
+        print(f"   classify:  {e['classification']}")
+        print(f"   recover:   {e['recovery']}")
+        print(f"   verify:    {e['verification']}")
+        print(f"   retry lim: {e['retry_limit']}  -> escalate: {e['escalation']}")
+
+
+def cmd_dry_run(args):
+    """Phase 84: simulate a task without executing anything."""
+    from .agent import AgentRuntime
+    cfg = _cfg()
+    rt = AgentRuntime(cfg)
+    try:
+        report = rt.dry_run(args.task)
+    finally:
+        rt.store.close()
+    if not report.get("ok"):
+        print("DRY RUN: BLOCKED")
+    else:
+        print("DRY RUN: would proceed")
+    for st in report["steps"]:
+        mark = "ok" if st["ok"] else "BLOCK"
+        print(f"  step {st['step']} {st['name']}: {mark}")
+        for name, ok, detail in st["verdicts"]:
+            print(f"    {'ok ' if ok else 'FAIL'} {name}: {detail}")
+    for b in report.get("blockers", []):
+        print(f"  BLOCKER: {b}")
+
+
+def cmd_backup(args):
+    """Phase 76: disaster backups (kept separate from live state)."""
+    from . import backup as backupmod
+    cfg = _cfg()
+    s = _store(cfg)
+    try:
+        if args.backup_cmd == "create":
+            bid = backupmod.create_backup(s, cfg, label=args.label)
+            print(f"backup #{bid} created")
+        elif args.backup_cmd == "list":
+            for b in s.backups_list():
+                proven = "PROVEN" if b["restored_ok"] else "untested"
+                print(f"  #{b['id']} {b['label']} {b['path']} "
+                      f"[{proven}] {b['includes']}")
+        elif args.backup_cmd == "verify":
+            ok, issues = backupmod.verify_backup(args.id, s)
+            print("OK" if ok else "MISMATCH")
+            for i in issues:
+                print(f"  {i}")
+        elif args.backup_cmd == "test-restore":
+            ok, detail = backupmod.test_restore(args.id, s)
+            print("RESTORE TEST: " + ("PASS" if ok else "FAIL"))
+            print(f"  {detail}")
+        elif args.backup_cmd == "prune":
+            pruned = backupmod.prune_backups(s, cfg, keep=args.keep)
+            print(f"pruned: {pruned}")
+    finally:
+        s.close()
 
 
 def main():
@@ -307,7 +456,24 @@ def main():
     sub.add_parser("locks").set_defaults(fn=cmd_locks)
     sub.add_parser("interventions").set_defaults(fn=cmd_interventions)
     sub.add_parser("world").set_defaults(fn=cmd_world)
-    sub.add_parser("recover").set_defaults(fn=cmd_recover)
+    p = sub.add_parser("recover")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what recovery would do, change nothing")
+    p.set_defaults(fn=cmd_recover)
+    p = sub.add_parser("matrix")
+    p.add_argument("--kind", default=None)
+    p.set_defaults(fn=cmd_matrix)
+    p = sub.add_parser("dry-run")
+    p.add_argument("task", help="task_id to simulate")
+    p.set_defaults(fn=cmd_dry_run)
+    p = sub.add_parser("backup")
+    bp = p.add_subparsers(dest="backup_cmd", required=True)
+    pc = bp.add_parser("create"); pc.add_argument("--label", default="manual")
+    bp.add_parser("list")
+    pv = bp.add_parser("verify"); pv.add_argument("id", type=int)
+    pt = bp.add_parser("test-restore"); pt.add_argument("id", type=int)
+    pp = bp.add_parser("prune"); pp.add_argument("--keep", type=int, default=7)
+    p.set_defaults(fn=cmd_backup)
     args = ap.parse_args()
     sys.exit(args.fn(args) or 0)
 
