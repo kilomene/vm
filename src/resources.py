@@ -141,3 +141,16 @@ def _clean_tmp(log_dir, pattern):
     except OSError:
         pass
     return n
+
+
+def process_rss_mb():
+    """Current process RSS in MB (phase 68: memory budget enforcement)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return kb / 1024
+    except OSError:
+        pass
+    return None
