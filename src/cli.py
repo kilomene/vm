@@ -115,6 +115,28 @@ def cmd_tasks(args):
     s.close()
 
 
+def cmd_task_op(args):
+    """pause/resume/cancel — updates status; the live agent honors it at the
+    next step boundary (state-aware cancellation for cancel)."""
+    s = _store(_cfg())
+    task = s.get_task(args.task_id)
+    if not task:
+        print(f"unknown task {args.task_id}")
+        s.close()
+        return
+    op = args.op
+    if op == "pause":
+        s.update_task(args.task_id, status="PAUSED")
+    elif op == "resume":
+        s.update_task(args.task_id, status="PENDING")
+    elif op == "cancel":
+        # Phase 52: requested via CLI; agent advances STOPPING->...->CANCELLED
+        s.update_task(args.task_id, status="CANCEL_REQUESTED")
+    s.journal("TASK_" + op.upper() + "_CLI", task_id=args.task_id)
+    print(f"{args.task_id}: {op} requested")
+    s.close()
+
+
 def cmd_submit(args):
     import uuid
     cfg = _cfg()
@@ -160,6 +182,94 @@ def cmd_diagnostics(args):
     s.close()
 
 
+def cmd_diagnose(args):
+    """Phase 59: one command summarizing the complete runtime."""
+    import shutil
+    cfg = _cfg()
+    s = _store(cfg)
+    print("AGENT STATUS")
+    sup_pid = _read_pid(os.path.join(cfg["run_dir"], "supervisor.pid"))
+    print(f"Supervisor: {'RUNNING (pid %d)' % sup_pid if sup_pid and _pid_alive(sup_pid) else 'DOWN'}")
+    hb = s.get_heartbeat("agent")
+    if hb and _pid_alive(hb["pid"] or 0):
+        age = time.time() - hb["ts"]
+        print(f"Agent: RUNNING (pid {hb['pid']})")
+        print(f"Current task: {hb['task_id']}")
+        print(f"Current step: {hb['step']}")
+        print(f"Last heartbeat: {age:.0f}s ago")
+        print(f"Last operation: {hb['operation']}")
+        print(f"Last action: {hb['last_action']}")
+    else:
+        print("Agent: DOWN")
+    try:
+        shb = s.get_heartbeat("supervisor")
+        print(f"Watchdog: {'RUNNING' if shb and _pid_alive(shb['pid'] or 0) else 'DOWN'}")
+    except Exception:
+        print("Watchdog: UNKNOWN")
+    tasks = s.list_tasks()
+    running = [t for t in tasks if t["status"] == "RUNNING"]
+    print(f"Tasks: {len(tasks)} total, {len(running)} running")
+    for t in running[:5]:
+        print(f"  {t['task_id']}: step {t['current_step']}")
+    sm = s.kv_get("safe_mode") or {}
+    print(f"Safe mode: {'ACTIVE' if sm.get('active') else 'off'}"
+          + (f" ({sm.get('reason')})" if sm.get("active") else ""))
+    print(f"Workers: subprocess-per-tool (no persistent pool)")
+    print(f"Locks held: {len(s.list_locks())}")
+    print(f"Open interventions: {len(s.interventions_open())}")
+    for iv in s.interventions_open()[:5]:
+        print(f"  #{iv['id']} task={iv['task_id']}: {iv['reason'][:70]}")
+    print(f"World state keys: {len(s.world_all())}")
+    try:
+        st = os.statvfs(cfg["base_dir"])
+        print(f"Disk: {st.f_bavail * st.f_frsize / 1e9:.1f} GB available")
+    except OSError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable"):
+                    print(f"RAM: {int(line.split()[1]) // 1024} MB available")
+                    break
+    except OSError:
+        pass
+    total, used, free = shutil.disk_usage(cfg["base_dir"])
+    print(f"Disk: {free // (1024**3)} GB free of {total // (1024**3)} GB")
+    hour_ago = time.time() - 3600
+    print(f"Restarts (last hour): {s.restart_count_since('agent', hour_ago)}")
+    s.close()
+
+
+def cmd_locks(args):
+    s = _store(_cfg())
+    locks = s.list_locks()
+    print(f"{len(locks)} locks:")
+    for l in locks:
+        age = time.time() - l["heartbeat_ts"]
+        print(f"  {l['lock_id']}: owner={l['owner']} pid={l['pid']} "
+              f"heartbeat {age:.0f}s ago op={l['operation']}")
+    s.close()
+
+
+def cmd_interventions(args):
+    s = _store(_cfg())
+    ivs = s.interventions_open()
+    print(f"{len(ivs)} open:")
+    for iv in ivs:
+        print(f"  #{iv['id']} task={iv['task_id']}")
+        print(f"    reason: {iv['reason']}")
+        print(f"    action needed: {iv['required_action']}")
+    s.close()
+
+
+def cmd_world(args):
+    import json as _j
+    s = _store(_cfg())
+    for k, v in s.world_all().items():
+        print(f"{k} = {_j.dumps(v['value'])[:100]} (via {v['verifier']})")
+    s.close()
+
+
 def cmd_recover(args):
     # Recovery happens automatically on agent start; this triggers it now
     # by asking a running agent, or runs it inline if none is up.
@@ -187,8 +297,16 @@ def main():
     p = sub.add_parser("submit"); p.add_argument("spec")
     p.add_argument("--id", default=None); p.add_argument("--cwd", default=None)
     p.set_defaults(fn=cmd_submit)
+    for op in ("pause", "resume", "cancel"):
+        p = sub.add_parser(f"task-{op}")
+        p.add_argument("task_id")
+        p.set_defaults(fn=cmd_task_op, op=op)
     sub.add_parser("restart").set_defaults(fn=cmd_restart)
+    sub.add_parser("diagnose").set_defaults(fn=cmd_diagnose)
     sub.add_parser("diagnostics").set_defaults(fn=cmd_diagnostics)
+    sub.add_parser("locks").set_defaults(fn=cmd_locks)
+    sub.add_parser("interventions").set_defaults(fn=cmd_interventions)
+    sub.add_parser("world").set_defaults(fn=cmd_world)
     sub.add_parser("recover").set_defaults(fn=cmd_recover)
     args = ap.parse_args()
     sys.exit(args.fn(args) or 0)
