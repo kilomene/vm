@@ -38,6 +38,19 @@ DEFAULTS = {
     "intervention_ttl_hours": 24,
     "control_port": 0,           # 0 = ephemeral; control binds 127.0.0.1 only
     "control_enabled": True,
+    # Phases 51-90
+    "pause_verify_s": 30,        # phase 66: deadline to verify a pause
+    "max_preemptions": 2,        # phase 65: starvation guard
+    "backup_dir": None,          # phase 76: defaults to <base>/backups
+    "backup_keep": 7,            # phase 76: retained backups
+    "backup_auto_hours": 24,     # phase 76: automatic backup cadence
+    "capability_ttl_s": 7 * 24 * 3600,  # phase 59: default grant lifetime
+    "escalation_requires_auth": True,   # phase 59: cap escalation needs token
+    "clock_drift_warn_s": 60,    # phase 70: warn threshold vs NTP
+    "clock_drift_fail_s": 300,   # phase 70: refuse lease validity beyond
+    "self_update_enabled": False,  # phase 71-75: opt-in only
+    "self_update_allow": [],     # explicit version allowlist; empty=deny
+    "fault_injection_enabled": False,  # phase 81: never on in production
 }
 
 
