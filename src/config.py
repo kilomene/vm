@@ -31,6 +31,13 @@ DEFAULTS = {
     "max_log_disk_mb": 100,
     # Health
     "health_port": 0,  # 0 = disabled; set to e.g. 127.0.0.1:9119 to enable
+    # Phases 26-60
+    "lock_ttl_s": 120,            # stale lock reap threshold
+    "lease_interval_s": 30,       # task lease heartbeat interval
+    "safe_mode_max_l3_retries": 2,  # enters safe mode after this many L3 failures
+    "intervention_ttl_hours": 24,
+    "control_port": 0,           # 0 = ephemeral; control binds 127.0.0.1 only
+    "control_enabled": True,
 }
 
 
