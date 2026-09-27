@@ -81,3 +81,72 @@ def authorize_config_write(path, auth_token=None):
     # A real deployment validates the token against a secret store.
     # Here: any non-empty token supplied out-of-band is accepted and logged.
     return True, "config write authorized"
+
+
+# ---- Phase 61: configuration versioning and restoration ----
+def snapshot_config(store, base_dir, paths=None, note=""):
+    """Version the current config files (content stored, not just hashes).
+    Call after any authorized config change. Returns version ids."""
+    import time
+    vids = []
+    for rel in (paths or PROTECTED_CONFIG):
+        full = os.path.join(base_dir, rel)
+        if not os.path.exists(full):
+            continue
+        with open(full) as f:
+            content = f.read()
+        vid = store.config_version_save(full, content, note=note)
+        vids.append((rel, vid))
+    if vids:
+        store.journal("CONFIG_VERSIONED", versions=[v[1] for v in vids],
+                      note=note)
+    return vids
+
+
+def restore_config(store, base_dir, rel_path, version_id=None):
+    """Restore a config file to a previous version (last-known-good by
+    default). The pre-restore content is versioned first so the restore
+    itself is reversible. Returns (ok, message)."""
+    full = os.path.join(base_dir, rel_path)
+    target = None
+    if version_id is not None:
+        for v in store.config_versions(full):
+            if v["id"] == version_id or v["version"] == version_id:
+                target = v
+                break
+        if target is None:
+            return False, f"version {version_id} not found for {rel_path}"
+    else:
+        target = store.config_last_known_good(full)
+        if target is None:
+            versions = store.config_versions(full, limit=1)
+            target = versions[0] if versions else None
+        if target is None:
+            return False, f"no saved version for {rel_path}"
+    # version the current (broken) content first — restore is reversible
+    if os.path.exists(full):
+        with open(full) as f:
+            store.config_version_save(full, f.read(),
+                                      note="pre-restore backup")
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w") as f:
+        f.write(target["content"])
+    # re-record the hash so integrity.verify() trusts the restored file
+    store.hash_record(full, sha256_file(full))
+    store.journal("CONFIG_RESTORED", path=rel_path, version=target["id"])
+    return True, f"restored {rel_path} to version {target['id']}"
+
+
+def mark_config_good(store, base_dir, paths=None):
+    """Mark current config versions as last-known-good (after the agent
+    proves healthy with them)."""
+    import time
+    now = time.time()
+    for rel in (paths or PROTECTED_CONFIG):
+        full = os.path.join(base_dir, rel)
+        versions = store.config_versions(full, limit=1)
+        if versions:
+            store.config_version_save(full, versions[0]["content"],
+                                      known_good=True,
+                                      note="promoted to last-known-good")
+    store.journal("CONFIG_MARKED_GOOD", at=now)
