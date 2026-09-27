@@ -24,6 +24,13 @@ vm-agent logs                # tail agent log
 vm-agent diagnostics         # heartbeats + recent journal
 vm-agent recover             # show unfinished tasks (auto-resume on start)
 vm-agent restart             # graceful restart via supervisor
+vm-agent diagnose            # full one-command status summary (phase 59)
+vm-agent locks               # list held locks
+vm-agent interventions       # open human interventions
+vm-agent world               # verified world state
+vm-agent task-pause <id>     # pause a task (step boundary)
+vm-agent task-resume <id>    # re-queue a paused/failed task
+vm-agent task-cancel <id>    # state-aware cancel (checkpoint, then stop)
 ```
 
 ## Architecture
