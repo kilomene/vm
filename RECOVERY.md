@@ -123,3 +123,130 @@ Reconstruct post-crash timelines with `vm-agent diagnostics`.
 - **Browser recovery needs a host driver.** Without one wired in, the
   browser subsystem reports `DOWN` and browser steps fail fast with a clear
   error instead of hanging.
+
+## Advanced reliability layer (phases 51–90)
+
+### What IS guaranteed
+
+- **Dependencies self-heal only when safe.** `dep_status()` reports
+  required/installed version, availability, compatibility, health, and
+  last-verification per dependency. `heal()` records every attempt in the
+  recovery history, reinstalls only when the failure classifies temporary,
+  and never touches a healthy dependency. Verified by
+  `test_dep_heal_skips_healthy` / `test_dep_classify_temp_vs_permanent`.
+- **Retry is governed by classification, not a fixed count.**
+  `classify()` maps (source, kind) → (TRANSIENT/RETRYABLE/PERMANENT/
+  POLICY_BLOCKED/HUMAN_REQUIRED, max retries, backoff). PERMANENT,
+  POLICY_BLOCKED, and HUMAN_REQUIRED are never retried by the agent's step
+  loop. Verified by `test_classify_permanent_never_retried` /
+  `test_classify_policy_blocked`.
+- **Recovery never repeats a failed method.** The failure fingerprint
+  excludes the task id, so the same failure across tasks shares one
+  signature; `FailureAnalyzer.choose_strategy()` skips methods already
+  failed for that signature and escalates when all are exhausted. Verified
+  by `test_failure_fingerprint_stable` /
+  `test_failure_analyzer_escalates_when_exhausted`.
+- **Every failure kind has a matrix entry.** The 24-entry recovery matrix
+  (`matrix.py`) is runtime policy: each entry carries detection →
+  classification → recovery → verification → retry limit → escalation.
+  Unknown kinds get a bounded default (retry_limit ≤ 2), never unbounded
+  retries. Verified by `test_matrix_complete` /
+  `test_matrix_unknown_kind_has_bounded_default`.
+- **The planner is monitored too.** Repetitive/oscillating plans are
+  diagnosed, the plan is rebuilt from verified world state (completed ops
+  pruned), validated, and resumed; rebuilds are refused after 2 per 5 min.
+  Verified by `test_planner_rebuild_replaces_failed_step` /
+  `test_planner_rebuild_guard` / `test_planner_recovery_via_agent`.
+- **Progress is measured from observable state, never model output.**
+  Store-backed fingerprints track `progress.*` world keys; 3 identical
+  fingerprints in a row marks the task STALLED. Verified by
+  `test_progress_stall_detected` / `test_progress_no_stall_when_changing`.
+- **Tasks cannot touch each other's operations or resources.**
+  Operation ownership (claim/heartbeat/expiry), resource ownership with
+  leases, and external-resource ownership are enforced; stale owners are
+  reaped as UNKNOWN (never assumed failed). Verified by
+  `test_ownership_claim_and_heartbeat` / `test_ownership_stale_reaped` /
+  `test_external_ownership_exclusive`.
+- **Capabilities are least-privilege with TTL.** A task gets exactly the
+  capabilities for the tools its spec uses; the agent checks per step
+  before execution; grants expire (lazy expiry on check). Escalation
+  capabilities always need an out-of-band token. Verified by
+  `test_caps_denied_by_default` / `test_caps_ttl_expiry`.
+- **Secrets never touch disk.** The vault is process-local in-memory only
+  (owner-scoped, TTL leases); refs resolve at execution time; the journal
+  scanner detects exposure. Verified by `test_vault_scoped_access` /
+  `test_vault_ttl` / `test_scan_for_exposure`.
+- **Config is versioned and restorable.** Every config change is
+  snapshotted; restore versions the current content first (restores are
+  reversible); `mark_config_good` pins the last known-good. Verified by
+  `test_config_version_and_restore` / `test_config_mark_good_pins_version`.
+- **Snapshots are content-verified.** `snapshot_save` hashes content;
+  `snapshot_verify` detects tampering; resume verifies the chain.
+  Verified by `test_snapshot_verify_detects_tamper`.
+- **External operations reconcile, never assume.** `reconcile_external()`
+  maps done→synced-done, in_progress→resuming, failed→retry,
+  unknown→unknown-open. Verified by `test_reconcile_external_done` /
+  `test_reconcile_external_in_progress_resuming`.
+- **CRITICAL work preempts, but cannot starve others.** At most 2
+  preemptions per task; state is checkpointed before preemption. Verified
+  by `test_preemption_triggered`.
+- **Pause/resume are verified, not assumed.** `request_pause` confirms the
+  task left RUNNING within a deadline; `request_resume` verifies the
+  snapshot chain first. Verified by `test_pause_verified` /
+  `test_resume_verifies_snapshot_chain`.
+- **Resource budgets stop runaway tasks.** Duration, tool-call, and memory
+  (RSS) budgets pause the task on exhaustion. Verified by
+  `test_memory_budget_pauses`.
+- **The clock is never trusted blindly.** `lease_valid` fails closed on an
+  unreliable clock; the supervisor marks the agent hung rather than
+  believing a stale beat; leases are never mass-expired on clock fault.
+  Verified by `test_lease_valid_fails_closed_on_bad_clock`.
+- **Self-update is opt-in and gated.** Refused unless `self_update_enabled`
+  and the version is on the allowlist; compatibility (schema/python/
+  version) is checked first; the pipeline is
+  DOWNLOAD→VERIFY→INSTALL ISOLATED→TEST→CANARY→SWITCH→HEALTH with rollback
+  on health failure. Verified by `test_update_blocks_without_allowlist` /
+  `test_update_compat_rejects`.
+- **Backups are proven, not just written.** Manifests hash every file;
+  `test_restore` restores to a temp dir and marks the backup proven;
+  `prune_backups` never deletes the only proven backup. Verified by
+  `test_backup_create_verify_restore` / `test_backup_prune_keeps_proven`.
+- **Self-protection is checked first.** `self_protection_check()` runs
+  before any other classification: log/journal/backup deletion, safety
+  source-file modification, safety-feature disablement, capability
+  self-grant, and `VM_AGENT_HOME` escape are all blocked. Verified by
+  `test_self_protection_blocks_log_deletion` (and siblings).
+- **Fault injection proves it, not just asserts it.** 11 injections run
+  against isolated temp homes; the compound suite (phase 89) combines
+  stale-lock + expired-lease + ambiguous-crash and asserts no duplicate
+  side effects. Verified by `test_faultinject_scenario_all_recover` and
+  `tests/test_compound.py`.
+- **Dry-run changes nothing.** `dry_run()` validates schema, policy,
+  capabilities, and budget feasibility per step without executing or
+  mutating state. Verified by `test_dry_run_blocks_protected` /
+  `test_dry_run_passes_safe`.
+
+### What is NOT guaranteed (honest limits)
+
+- **The executor does not independently enforce capabilities.** The agent
+  checks per step before calling the executor, but a direct caller of
+  `Executor.run()` bypasses capability checks. Capability enforcement is a
+  property of the agent loop, not the tool layer.
+- **The vault dies with the process.** Secrets must be re-provisioned after
+  every agent restart; there is deliberately no durable secret store.
+- **Failure fingerprints are error-class based.** Two different root
+  causes with the same error class share a signature; volatile details
+  (pids, timestamps) are normalized away, which can merge distinct
+  failures.
+- **Stall detection needs observable writes.** Tasks whose progress isn't
+  reflected in `progress.*` world keys look stalled after 3 unchanged
+  cycles; steps must record observable progress.
+- **Priority preemption is cooperative.** Preemption happens at step
+  boundaries; a single very long step delays preemption until it finishes
+  or its tool timeout fires.
+- **Self-update canary is a smoke test, not proof.** The canary runs
+  controlled operations on the new runtime; it cannot prove the absence of
+  behavioral regressions.
+- **The 6 root-required integration tests were syntax-verified only.**
+  They need a real root install (`/opt/vm-agent`) and were not executed
+  live in this environment.
