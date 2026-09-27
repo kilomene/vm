@@ -238,7 +238,12 @@ class RecoveryManager:
         # 7. network classification probe (DNS)
         try:
             import socket as _s
-            _s.getaddrinfo("example.com", 80, timeout=5)
+            _prev = _s.getdefaulttimeout()
+            _s.setdefaulttimeout(5)
+            try:
+                _s.getaddrinfo("example.com", 80)
+            finally:
+                _s.setdefaulttimeout(_prev)
             report["fixed"].append("network: dns ok")
         except OSError as e:
             kind = netmod.classify(str(e))
