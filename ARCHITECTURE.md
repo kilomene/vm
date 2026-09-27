@@ -50,7 +50,10 @@ to auto-approve — refusal is the safe default).
 SQLite tables: `tasks`, `checkpoints`, `heartbeats`, `kv`,
 `locks`/`leases` (phase 27/32), `operations` op registry (30/31),
 `interventions` (46), `snapshots`/`world_state`/`model_claims` (34/35),
-`file_hashes` (45), `budgets` (39), `restarts`, `audit` (47).
+`file_hashes` (45), `budgets` (39), `restarts`, `audit` (47),
+`capabilities` (59), `resource_owners`/`external_resources` (59/64),
+`config_versions` (61), `backups` (76), `recovery_attempts`/
+`failure_fingerprints` (56), `migrations` (63), `executions` (85).
 Plus an append-only JSONL event journal (`state/journal/`).
 Thread-safe via an RLock (journal is called from lock-holding methods).
 
@@ -73,6 +76,53 @@ recover|locks|interventions|world|task-pause|task-resume|task-cancel`.
 - `integrity.py` — file integrity hashes + protected-config auth (45)
 - `remote.py` — localhost-only token-auth control API (50)
 
+### 9. Advanced reliability layer (phases 51–90)
+- `deps.py` — extended: failure classification, bounded safe repair,
+  recovery-history recording (51)
+- `planner.py` — stall diagnosis, verified-state plan rebuild, rebuild
+  guard (2 per 5 min), plan validation (53)
+- `progress.py` — store-backed observable-state fingerprints, stall
+  detection (3 identical = STALLED) (55)
+- `classify.py` — retry classification + backoff sequences; PERMANENT/
+  POLICY_BLOCKED/HUMAN_REQUIRED are never retried (54)
+- `failure.py` — failure fingerprinting (task_id excluded by design),
+  recovery history, strategy selection that skips already-failed methods
+  and escalates on exhaustion (56)
+- `matrix.py` — 24-entry recovery matrix: detection → classification →
+  recovery → verification → retry limit → escalation per kind; bounded
+  default for unknown kinds (57)
+- `sysgraph.py` — dependency graph: restart scope, blast radius, safe
+  restart order, component health (58)
+- `ownership.py` — operation/resource/external-resource ownership with
+  leases and heartbeats; stale owners reaped as UNKNOWN, never assumed
+  failed (59/64)
+- `caps.py` — least-privilege capability grants per tool, TTL expiry,
+  out-of-band token for escalation (59)
+- `secrets.py` — process-local in-memory vault (owner-scoped, TTL);
+  journal exposure scanner (60)
+- `integrity.py` — extended: config versioning + reversible restore +
+  last-known-good pins (61)
+- `timecheck.py` — clock reliability: fail-closed `lease_valid`, hang on
+  suspect beats, never mass-expire leases on clock fault (62)
+- `update.py` — gated self-update (opt-in + allowlist), compatibility
+  check, ordered migrations, canary→switch→health pipeline with rollback
+  (63)
+- `txn.py` — extended: `reconcile_external` (done→synced-done,
+  in_progress→resuming, failed→retry, unknown→unknown-open) (64)
+- `recovery.py` — extended: recovery-priority ordering (65),
+  verified pause/resume (66), content-hashed snapshots (67), resource
+  budgets incl. RSS (68), prioritization (69)
+- `backup.py` — disaster backups: content-hashed manifests, proven-restore
+  marking, prune that never deletes the only proven backup (76)
+- `policy.py` — extended: self-protection checked first — log/journal/
+  backup deletion, safety-file modification, safety-feature disablement,
+  capability self-grant, `VM_AGENT_HOME` escape all blocked (78)
+- `faultinject.py` — 11 fault-injection scenarios against isolated temp
+  homes (79)
+- `agent.py` — extended: step-level capability enforcement, verified
+  pause/resume, pause-confirm, CRITICAL preemption (cap 2/task),
+  cooperative cancellation flow (52/65/66/69)
+
 ## Data flow (one step)
 
 ```
@@ -87,16 +137,26 @@ spec step → op registry (skip if COMPLETED) → policy.classify
                           shutdown? → PAUSED (resume later)
 ```
 
-## Data flow (one step)
+## Data flow (one step, phases 51–90)
 
 ```
-spec step → policy.classify → executor.run → ToolResult
-                                              ↓
-                                    verifier.verify_step → Verdict
-                                              ↓
-                              pass? → checkpoint → next step
-                              fail? → retry (backoff) → FAILED
-                              shutdown? → PAUSED (resume later)
+spec step → self-protection check (policy, first)
+    → op registry (skip if COMPLETED / reconcile if UNKNOWN)
+    → capability check (denied → intervention)
+    → policy.classify → budget check (duration/tool-calls/RSS)
+    → executor.run → ToolResult
+                      ↓
+            verifier.verify_step → Verdict
+                      ↓
+      pass? → op COMPLETED → checkpoint → next step
+      fail? → classify error → retry per backoff (never if
+              PERMANENT/POLICY_BLOCKED/HUMAN_REQUIRED)
+            → recovery.recover(kind="step_failed") → recovery matrix
+              method → verify → escalate L1..L8
+      stall? → progress fingerprint unchanged ×3 → STALLED → planner
+              diagnose → rebuild plan from verified state → resume
+      cancel? → STOPPING→CLEANUP→CHECKPOINT→CANCELLED
+      shutdown? → PAUSED (resume later)
 ```
 
 ## Heartbeat protocol
