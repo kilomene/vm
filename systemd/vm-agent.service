@@ -1,0 +1,28 @@
+[Unit]
+Description=vm-agent persistent self-recovering agent runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=VM_AGENT_HOME=/opt/vm-agent
+Environment=PYTHONPATH=/opt/vm-agent/lib
+ExecStart=/usr/bin/python3 -m vmagent.supervisor
+WorkingDirectory=/opt/vm-agent
+Restart=always
+RestartSec=10
+# Graceful shutdown: SIGTERM -> supervisor stops agent cleanly
+KillSignal=SIGTERM
+TimeoutStopSec=60
+# Hardening (does not weaken OS controls).
+# NOTE: ProtectHome/ProtectSystem are omitted: the install may live in $HOME
+# (persistent in containers). The service still runs as an unprivileged user
+# when installed by one, and writes only under VM_AGENT_HOME.
+NoNewPrivileges=true
+PrivateTmp=true
+# Logs
+StandardOutput=append:/opt/vm-agent/logs/supervisor.out
+StandardError=append:/opt/vm-agent/logs/supervisor.out
+
+[Install]
+WantedBy=multi-user.target
