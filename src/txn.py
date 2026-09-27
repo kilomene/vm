@@ -77,8 +77,26 @@ class TxnRunner:
     # ---- transactional execution (phase 29) ----
     def run_txn(self, op_id, task_id, kind, prepare_fn, execute_fn,
                 verify_fn, rollback_fn=None, commit_fn=None,
-                idempotency_key=None, reconcile_fn=None):
-        """Full prepare/execute/verify/commit cycle with rollback on failure."""
+                idempotency_key=None, reconcile_fn=None,
+                external_resource=None):
+        """Full prepare/execute/verify/commit cycle with rollback on failure.
+
+        Phase 63/64: if the operation touches an external resource, ownership
+        of that resource is claimed first (exclusive, with lease); after
+        execution the local record is reconciled against the external
+        resource's actual state.
+        """
+        if external_resource:
+            from . import ownership as ownershipmod
+            ok, msg = ownershipmod.own_external(
+                self.store, task_id, external_resource)
+            if not ok:
+                self.journal("EXT_OWNERSHIP_DENIED", op_id=op_id,
+                             resource=external_resource, reason=msg)
+                return TxnResult(False, "paused",
+                                 {"reason": f"external ownership: {msg}"})
+            self.journal("EXT_OWNERSHIP_TAKEN", op_id=op_id,
+                         resource=external_resource)
         run, reason = self.should_run(op_id, reconcile_fn)
         self.journal("TXN_DECISION", op_id=op_id, run=run, reason=reason,
                      task_id=task_id)
@@ -148,3 +166,52 @@ class TxnRunner:
 
 def new_op_id(kind):
     return f"{kind}:{uuid.uuid4().hex[:12]}"
+
+
+def reconcile_external(store, op_id, probe_fn, resume_fn=None, journal=None):
+    """Phase 64: reconcile a local op record against the external
+    resource's actual state (state synchronization).
+
+    probe_fn() -> {"state": "done"|"in_progress"|"failed"|"unknown",
+                   "evidence": {...}}
+
+    Returns (decision, detail); decision is one of:
+      synced-done   — external proves completion; local record committed
+      resuming      — external in progress; progress resumption armed
+      retry         — external failed; local record reset to PENDING
+      unknown-open  — cannot prove; left UNKNOWN for human review (never
+                      assumed failed, never assumed done)
+    """
+    j = journal or (lambda e, **k: None)
+    rec = store.op_get(op_id)
+    if not rec:
+        return "unknown-open", {"reason": "no local record"}
+    try:
+        probe = probe_fn()
+    except Exception as e:  # noqa: BLE001
+        probe = {"state": "unknown", "evidence": {"error": repr(e)}}
+    state = (probe or {}).get("state", "unknown")
+    j("EXT_RECONCILED", op_id=op_id, external_state=state,
+      evidence=(probe or {}).get("evidence"))
+    if state == "done":
+        # result verification: external evidence commits the local record
+        store.op_set(op_id, rec.get("task_id"), rec["kind"], "COMPLETED",
+                     result={"reconciled": True,
+                             "evidence": (probe or {}).get("evidence")})
+        return "synced-done", probe
+    if state == "in_progress":
+        # progress resumption: keep tracking, resume monitoring
+        if resume_fn:
+            try:
+                resume_fn()
+            except Exception as e:  # noqa: BLE001
+                return "unknown-open", {"error": repr(e)}
+        return "resuming", {"note": "external op still running"}
+    if state == "failed":
+        # failure recovery of the in-progress operation: safe to retry
+        store.op_set(op_id, rec.get("task_id"), rec["kind"], "PENDING",
+                     result={"external_failed": (probe or {}).get("evidence")})
+        return "retry", probe
+    store.op_set(op_id, rec.get("task_id"), rec["kind"], "UNKNOWN",
+                 result={"evidence": (probe or {}).get("evidence")})
+    return "unknown-open", probe
