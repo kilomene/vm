@@ -20,17 +20,25 @@ POLICIES = {
     "unknown":           (True, 3, 5, "cautious default"),
 }
 
+# Classification patterns. Numeric patterns are HTTP-context or
+# word-boundary anchored: bare substrings like "401" misfire on PIDs
+# ("process 40123 exited"), byte counts ("wrote 429 bytes"), and version
+# numbers, misclassifying permanent local errors as transient network
+# ones (which then burn retries and backoff).
 _PATTERNS = [
-    ("dns_failure", [r"Name or service not known", r"DNS", r"getaddrinfo failed",
+    ("dns_failure", [r"Name or service not known", r"\bDNS\b", r"getaddrinfo failed",
                      r"nodename nor servname", r"Temporary failure in name resolution"]),
     ("no_internet", [r"Network is unreachable", r"No route to host"]),
     ("connection_timeout", [r"timed out", r"Connection timed out", r"TimeoutError"]),
-    ("tls_failure", [r"SSL", r"certificate", r"TLS", r"handshake failure"]),
-    ("rate_limited", [r"429", r"rate limit", r"Too Many Requests", r"temporarily blocked"]),
-    ("remote_server_error", [r" 5\d\d ", r"Internal Server Error", r"Bad Gateway",
-                             r"Service Unavailable", r"Gateway Timeout"]),
-    ("auth_failure", [r"401", r"403", r"Unauthorized", r"Forbidden",
-                      r"authentication failed", r"invalid credentials", r"invalid token"]),
+    ("tls_failure", [r"\bSSL\b", r"certificate", r"\bTLS\b", r"handshake failure"]),
+    ("rate_limited", [r"\bHTTP(?: Error)? 429\b", r"rate limit", r"Too Many Requests",
+                      r"temporarily blocked"]),
+    ("remote_server_error", [r"\bHTTP(?: Error)? 5\d\d\b", r"Internal Server Error",
+                             r"Bad Gateway", r"Service Unavailable",
+                             r"Gateway Timeout"]),
+    ("auth_failure", [r"\bHTTP(?: Error)? 40[13]\b", r"Unauthorized", r"Forbidden",
+                      r"authentication failed", r"invalid credentials",
+                      r"invalid token"]),
     ("local_firewall", [r"Permission denied.*connect", r"firewall", r"blocked by policy"]),
 ]
 
