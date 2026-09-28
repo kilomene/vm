@@ -112,10 +112,19 @@ Reconstruct post-crash timelines with `vm-agent diagnostics`.
   mid-write can still lose the last un-checkpointed step. The design bounds
   the loss to one step, it does not eliminate it.
 - **Reconciliation is only as good as the `idempotent_check`.** If a step
-  declares no check, resume re-executes it. Non-idempotent steps without
-  checks can double-apply — declare checks for every side-effecting step.
-- **Safe mode needs a human.** The runtime stops and preserves state, but
-  only an operator (`vm-agent diagnose`, then fix, then resume) clears it.
+  declares no check and no `op_id`, resume re-executes it. A step with an
+  `op_id` but no `idempotent_check` cannot be reconciled, so resume pauses
+  it and opens a human intervention instead of guessing. Non-idempotent
+  steps without checks can double-apply — declare checks for every
+  side-effecting step.
+- **Safe mode needs a human — except clock-caused safe mode.**
+  Escalation-triggered safe mode stops the runtime and preserves state;
+  only an operator clears it (`vm-agent safe-mode status` to inspect,
+  `vm-agent safe-mode exit [--note TEXT]` to clear). A single clock blip
+  never latches safe mode: it takes `clock_fail_threshold` (default 3)
+  consecutive bad clock checks to enter, and clock-caused safe mode
+  auto-clears after `clock_recover_threshold` (default 3) consecutive
+  good checks.
 - **The control API is localhost-only by design.** Remote access requires an
   SSH tunnel; there is no built-in TLS or multi-user auth.
 - **Hang detection is heuristic.** A task making slow-but-real progress can
