@@ -96,10 +96,34 @@ class Verifier:
         return ok, {"url": url, "status": r.exit_code,
                     "contains_match": True if contains is None else (contains in (r.stdout or ""))}
 
-    def _process_running(self, pattern):
-        r = self.ex.run("shell", args={
-            "command": f"ps aux | grep -F '{pattern}' | grep -v grep | head -3",
-            "timeout_s": 15})
-        ok = bool((r.stdout or "").strip())
+    @staticmethod
+    def _process_running(pattern):
+        """Check whether any process command line contains the pattern.
+
+        Scans /proc/*/cmdline directly in Python — the pattern is never
+        interpolated into a shell string, so a hostile pattern like
+        "'; touch /tmp/x; '" is matched literally (or not at all) and
+        can have no side effect. Fixed-string semantics (like grep -F).
+        """
+        sample = []
+        try:
+            pids = os.listdir("/proc")
+        except OSError:
+            return False, {"pattern": pattern, "running": False,
+                           "error": "/proc unavailable"}
+        for pid in pids:
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\0", b" ").decode(
+                        "utf-8", "replace").strip()
+            except OSError:
+                continue  # process exited or unreadable; skip
+            if pattern and pattern in cmdline:
+                sample.append(f"{pid}: {cmdline[:120]}")
+                if len(sample) >= 3:
+                    break
+        ok = bool(sample)
         return ok, {"pattern": pattern, "running": ok,
-                    "sample": (r.stdout or "")[:300]}
+                    "sample": "\n".join(sample)[:300]}
