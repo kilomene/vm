@@ -81,6 +81,9 @@ RULES = {
 _REPEAT_ESCALATION = {
     TRANSIENT: HUMAN_REQUIRED,
     RETRYABLE: HUMAN_REQUIRED,
+    # a step that already burned its whole retry budget and then fails
+    # again on the next run is not a flake: escalate, don't loop blindly.
+    "retry_exhausted": HUMAN_REQUIRED,
 }
 
 
@@ -112,6 +115,7 @@ def backoff_sequence(source, kind):
 _TOOL_PATTERNS = [
     (r"timed out|timeout", "timeout"),
     (r"command not found|No such file or directory.*command", "invalid_command"),
+    (r"No such file or directory", "missing_resource"),
     (r"Permission denied", "missing_resource"),
     (r"not supported|unsupported|unknown tool", "unsupported"),
 ]
@@ -122,6 +126,10 @@ def classify_tool_error(stderr, exit_code=None):
     for pat, kind in _TOOL_PATTERNS:
         if re.search(pat, text, re.IGNORECASE):
             return classify("tool", kind)
+    if exit_code == 127:
+        # POSIX "command not found" (bash: "command not found"; dash:
+        # "sh: 1: foo: not found"). Permanent by definition — never retry.
+        return classify("tool", "invalid_command")
     if exit_code not in (None, 0):
         return classify("tool", "exit_nonzero")
     return classify("unknown", "unknown")
