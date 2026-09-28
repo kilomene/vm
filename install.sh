@@ -58,10 +58,14 @@ fi
 # 8. Initialize database (creates schema on first Store open)
 VM_AGENT_HOME="$PREFIX" PYTHONPATH="$PREFIX/lib" python3 -c "
 from vmagent.state import Store
-from vmagent import config
+from vmagent import config, integrity
 cfg = config.load('$PREFIX')
 s = Store(cfg['state_db'], cfg['journal_dir'])
 s.journal('INSTALL', version='1.0.0')
+# install-time integrity baseline: verify() compares against these
+# hashes, so without this the boot-time integrity check is vacuous.
+recorded = integrity.record(s, '$PREFIX')
+print('integrity baseline recorded:', sorted(recorded))
 s.close()
 print('database initialized:', cfg['state_db'])
 "
