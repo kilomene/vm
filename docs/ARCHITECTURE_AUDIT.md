@@ -40,8 +40,85 @@ known gap — not to re-assert the design.
 6. **`secrets.py` missing `import os`** in `scan_journal` — NameError on
    any journal scan. Fixed.
 
-All six were invisible to unit-style reading and surfaced only when the
-agent loop actually ran the paths. This is why the phase-89 compound
+7. **Vault-resolved secrets journaled raw.** `_resolve_vault_refs`
+   substituted `vault_get` values into step args and `Executor._redact`
+   only redacted by argument *name* — a secret passed as `command` was
+   journaled raw in `TOOL_STARTED`. Fixed: `_resolve_vault_refs` now
+   returns `(resolved_args, secret_values)`; `Executor.run` takes
+   `redact_values` and redacts them by value in the journal entry and
+   in `ToolResult.stdout/stderr` before journaling/return (so `last_err`
+   and `last_verified_result` inherit the redaction). New
+   `secrets.redact_values()` helper.
+
+8. **No integrity baseline at install.** `reconcile_on_boot` warned "no
+   integrity baseline recorded" on every fresh install; worse, TRACKED
+   included the live SQLite `state/state.db` (always "modified") and a
+   `systemd/vm-agent.service` path that is never installed under the
+   prefix. Fixed: `install.sh` records the baseline at install time;
+   TRACKED is `config/config.json` only; new `integrity.ensure_baseline()`
+   records on first boot if missing (journaling
+   `INTEGRITY_BASELINE_RECORDED`); `snapshot_config` re-records hashes
+   after an authorized change.
+
+9. **`recover --dry-run` crashed with `KeyError`.** `cmd_recover` read
+   fingerprint columns (`failure_kind`, `last_method`, `operation`) that
+   don't exist in the `failure_fingerprints` table. Fixed: the table
+   gained the real `operation` column (migration + fresh CREATE);
+   `Store.recovery_record(..., operation=...)` populates it,
+   `failure.record` and `RecoveryManager.recover` thread it through, and
+   the dry-run reads the real `kind`/`last_method`/`operation` columns.
+
+10. **Control token created with a chmod-after-create race.**
+    `ensure_token` wrote the token file then chmodded to 0600 — on a
+    shared host another uid could read it in between. Fixed: atomic
+    `O_CREAT|O_EXCL` open with mode 0600 (`FileExistsError` reads the
+    existing token; half-written files unlinked); `run/` created and
+    tightened to 0700.
+
+11. **`process_running` verifier interpolated the pattern into a shell
+    pipeline** (`ps aux | grep -F '{pattern}'`) — a malicious pattern
+    could inject shell. Fixed: pure-Python `/proc/*/cmdline` scan with
+    the same fixed-string semantics, no shell at all.
+
+12. **Policy missed shell forms and had no file-write guard.** Power
+    actions reached via path (`/sbin/shutdown`), `env`, subshells,
+    newlines, `systemctl poweroff/reboot/halt/kill`, and `init 0/6` were
+    not matched; state-destruction forms beyond `rm` (`find … -delete`,
+    `mv`, `truncate`) were not matched; and `write_file`/`mkdir` had no
+    policy check at all — a step could overwrite
+    `lib/vmagent/policy.py` or the state DB. Fixed: broadened
+    `PROTECTED_PATTERNS`, new `Policy.authorize_path` (realpath-resolved,
+    refuses writes under `state/`, `lib/vmagent/`, `config/`, `run/`),
+    wired into `_run_step`'s retry loop and `dry_run` verdicts.
+    SECURITY.md/ARCHITECTURE.md now state the policy is a best-effort
+    guardrail against accidental damage, not a security boundary — the
+    real boundary is the OS user plus systemd hardening.
+
+13. **`_run_step` recorded failures from a stale task snapshot.**
+    `failed_steps`/`retry_count` were computed from the `task` dict
+    fetched once at `run_task` start, so a second step failure in the
+    same long task overwrote the first failure's values. Fixed: re-read
+    via `store.get_task(task_id)` immediately before computing.
+
+14. **`reconcile_on_boot` never re-queued stuck RUNNING tasks.** The
+    docs (RECOVERY.md) promised re-queueing; the code had a dead `pass`
+    lease loop and only appended a warning. Fixed: stuck RUNNING tasks
+    with no live agent are set PENDING, their stale leases released, and
+    `TASK_REQUEUED_ON_BOOT` journaled. No double-run with
+    `AgentRuntime.recover()`: `recover()` resumes only RUNNING/PAUSED,
+    `serve_forever` picks up only PENDING, and both funnel through
+    `claim_lease`.
+
+15. **No upper bound on spec-supplied `timeout_s`; control failure hid
+    the exception type.** Fixed: `tool_timeout_max_s` (default 3600s,
+    in config DEFAULTS) caps `Executor._sane_timeout` on top of the
+    existing non-positive clamp; and `serve_forever`'s control-start
+    block was extracted to `AgentRuntime._start_control()`, which
+    journals `CONTROL_FAILED` with `error_type=type(e).__name__`
+    explicitly.
+
+All fifteen were invisible to unit-style reading and surfaced only when
+the agent loop actually ran the paths. This is why the phase-89 compound
 suite and phase-79 fault-injection exist.
 
 ## What the tests prove (counts from the 2026-09-27 run)
@@ -56,6 +133,61 @@ suite and phase-79 fault-injection exist.
   verified state.
 - `tests/test_reliability.py`: 37 tests — phases 26–60, re-run after the
   agent/recovery fixes to confirm no regression.
+
+## Bug-fix pass (2026-09-28) — 14 items
+
+Seven real fixes, one missing feature implemented, five reported bugs
+verified absent (pinned with regression guards), one doc correction:
+
+- Fixed: supervisor hang detection re-baselined `_last_progress` every
+  tick so idle time never accumulated; three-valued op reconcile
+  (ambiguous ops pause instead of retrying); clock safe-mode hysteresis
+  + `safe-mode exit` operator command; error classification on real
+  stderr with permanent errors running exactly once; per-step retry caps
+  with repeated-failure escalation to human; `redact_text` consulting the
+  canonical module vault; non-positive tool timeouts clamped to default.
+- Implemented: `task-retry --from-step N` (did not exist) with the
+  1-based → `current_step` mapping correct by construction.
+- Verified absent (regression tests added, no code change): failure
+  history SQL fault, budget off-by-one, `stop_agent` first-`wait`
+  `TimeoutExpired`, `check_env_compatible` result-dict, global
+  `time.sleep` patch.
+- Doc correction: SECURITY.md described aspirational systemd sandboxing
+  (`ProtectHome`/`ProtectSystem`, dedicated user) — now describes the
+  real unit.
+
+## Bug-fix pass (2026-09-28) — items 6–14 (second pass)
+
+Each item below was reproduced with a failing regression test through
+the real `AgentRuntime`/`Supervisor` path before the fix, then verified
+passing after; the full suites (`test_reliability.py`,
+`test_phase3.py`, `test_e2e_wiring.py`, `test_compound.py`) were green
+after every commit (162 passed at the end of the pass;
+`tests/test_vm.py` needs a live `/opt/vm-agent` install and was not run).
+
+- Implemented: value-based redaction of vault-resolved secrets
+  (`redact_values` through `_resolve_vault_refs` → `Executor.run` →
+  journal + tool results); integrity baselines recorded at
+  install/first-boot with `TRACKED=[config/config.json]`;
+  `failure_fingerprints.operation` column wired through record →
+  recover → `recover --dry-run`; `Policy.authorize_path` guarding
+  `write_file`/`mkdir` against the install prefix's protected trees.
+- Fixed: `recover --dry-run` `KeyError`; control-token
+  chmod-after-create race (atomic `O_CREAT|O_EXCL` 0600, `run/` 0700);
+  `process_running` shell interpolation (pure-Python `/proc` scan);
+  policy pattern gaps (power actions, `init`, state-destruction forms);
+  stale task snapshot in `_run_step`; dead lease loop in
+  `reconcile_on_boot` (now actually re-queues RUNNING → PENDING);
+  unbounded spec `timeout_s` (new `tool_timeout_max_s` cap);
+  `CONTROL_FAILED` now logs the exception type explicitly.
+- Doc corrections: SECURITY.md §Protected operations and
+  ARCHITECTURE.md §5 now state the policy layer is a best-effort
+  guardrail against accidental damage, not a security boundary — the
+  real boundary is the OS user the service runs as plus the systemd
+  hardening that ships (`NoNewPrivileges`, `PrivateTmp`).
+- Deliberately not changed: `tests/test_vm.py` (needs a live install;
+  out of scope); pid-recycled heartbeats in reconcile (pre-existing
+  limitation, unchanged semantics).
 
 ## Known gaps (documented, not fixed — see RECOVERY.md)
 
@@ -75,12 +207,15 @@ suite and phase-79 fault-injection exist.
   recovery logic, not the installed runtime on a real host.
 - **Self-update canary is a smoke test.** It cannot prove the absence of
   behavioral regressions; the pipeline is opt-in and allowlist-gated.
-- **6 root-required integration tests were syntax-verified only.**
-  They need a real root install (`/opt/vm-agent`) and were not executed
-  live in this environment.
-- **`tests/test_vm.py` has 5 pre-existing failures** from the missing
-  `/opt/vm-agent` binary (environment limitation, unrelated to this
-  phase).
+- **6 root-required integration tests were syntax-verified only**
+  (`tests/test_vm.py`). They need a real root install (`/opt/vm-agent`)
+  and were not executed live in this environment; they are deselected
+  here (the old "5 pre-existing failures" note had a stale count).
+- **`supervisor.stop_agent`'s post-SIGKILL wait is unwrapped.** The first
+  `p.wait()` is guarded (SIGTERM-ignoring child → SIGKILL, pinned by
+  test); the second `p.wait(timeout=10)` after `p.kill()` would raise
+  `TimeoutExpired` out of `stop_agent` for a SIGKILL-immune (D-state)
+  process.
 
 ## Verdict
 
