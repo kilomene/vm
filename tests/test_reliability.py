@@ -198,6 +198,23 @@ def test_net_classify(text, kind):
     assert net_classify(text) == kind
 
 
+@pytest.mark.parametrize("text,kind", [
+    # loose numeric substrings must not misfire on PIDs / byte counts
+    ("process 40123 exited with code 1", "unknown"),
+    ("wrote 429 bytes to /tmp/x", "unknown"),
+    ("command failed with status 500", "unknown"),
+    ("error 5003 in module foo", "unknown"),
+    # genuine HTTP-context failures still classify
+    ("HTTP 401 Unauthorized", "auth_failure"),
+    ("HTTP Error 403 Forbidden", "auth_failure"),
+    ("HTTP 429 Too Many Requests", "rate_limited"),
+    ("HTTP 500 Internal Server Error", "remote_server_error"),
+    ("HTTP Error 503 Service Unavailable", "remote_server_error"),
+])
+def test_net_classify_no_false_positives(text, kind):
+    assert net_classify(text) == kind
+
+
 def test_net_retry_policy_shape():
     assert should_retry("connection_timeout", 0) is True
     assert backoff_delay("connection_timeout", 0) > 0
