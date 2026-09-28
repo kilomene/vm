@@ -12,6 +12,12 @@ Design: secrets live in an in-memory vault (never persisted to SQLite or
 the journal). Tools receive them via a controlled `SecretRef` placeholder
 that is substituted at the last moment inside the executor and redacted
 from every record.
+
+Canonical store: the module-level `_VAULT` dict behind `vault_set` /
+`vault_get` / `vault_drop` (scoped leases per task). The `SecretVault`
+class below is a legacy alternate that is not used by the runtime;
+`redact_text` consults both, but the runtime resolves and redacts through
+the module-level store only.
 """
 import os
 import re
@@ -82,16 +88,45 @@ class SecretVault:
         self._secrets.pop(name, None)
 
 
-def redact_text(text, vault=None):
-    """Redact known secret values and anything matching exposure patterns."""
+def redact_values(text, values):
+    """Redact a caller-supplied list of raw secret values from free text.
+
+    Used when the runtime knows exactly which values were substituted for
+    this step (e.g. resolved {"vault": ...} refs) — value-based redaction
+    catches secrets regardless of the argument NAME they traveled under
+    ("content", "command", ...), which name-based redaction misses.
+    """
     if not text:
         return text
     out = str(text)
-    if vault:
+    for val in values or []:
+        v = str(val) if val is not None else ""
+        if v and len(v) >= 4:
+            out = out.replace(v, "***REDACTED***")
+    return out
+
+
+def redact_text(text, vault=None):
+    """Redact known secret values and anything matching exposure patterns.
+
+    The module-level vault (populated by vault_set, the canonical store
+    the agent and CLI use) is always consulted: a secret stored via
+    vault_set must be redacted even when the caller passes no explicit
+    vault. An explicit SecretVault instance's values are redacted too.
+    """
+    if not text:
+        return text
+    out = str(text)
+    values = []
+    if vault is not None:
         for name in vault.names():
-            val = vault._secrets.get(name)
-            if val and len(val) >= 4:
-                out = out.replace(val, "***REDACTED***")
+            values.append(vault._secrets.get(name))
+    # canonical module-level vault: vault_set/vault_get/vault_drop
+    for rec in _VAULT.values():
+        values.append(rec.get("value"))
+    for val in values:
+        if val and len(val) >= 4:
+            out = out.replace(val, "***REDACTED***")
     for pat in EXPOSURE_PATTERNS:
         out = pat.sub("***REDACTED***", out)
     return out
