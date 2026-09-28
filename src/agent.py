@@ -79,6 +79,7 @@ class AgentRuntime:
         self._last_beat = 0
         self._cancel_requested = set()  # task_ids with cancellation in flight
         self._task_start_ts = {}
+        self._step_fail_streak = {}  # (task_id, step_name) -> consecutive fails
 
     def _journal_fn(self, event, **kw):
         kw.setdefault("task_id", self._current_task)
@@ -301,6 +302,35 @@ class AgentRuntime:
         return ok
 
     # ---- task engine ----
+    def _escalate_repeated_failure(self, task_id, step):
+        """The same step failing twice in a row is not a flake: open a
+        human intervention (retry_exhausted -> HUMAN_REQUIRED) instead of
+        letting a third blind retry loop run. Returns True when escalated.
+
+        Only *consecutive* failures of the same step count — a success, or
+        a different step failing, resets the streak.
+        """
+        name = step.get("name", "")
+        key = (task_id, name)
+        streak = self._step_fail_streak.get(key, 0) + 1
+        self._step_fail_streak = {k: v for k, v in
+                                  self._step_fail_streak.items()
+                                  if k[0] != task_id}
+        self._step_fail_streak[key] = streak
+        if streak < 2:
+            return False
+        decision = classifymod.escalate_on_repeat("retry_exhausted")
+        self.journal("REPEAT_FAILURE_ESCALATED", task_id=task_id, step=name,
+                     streak=streak, policy="retry_exhausted",
+                     decision=decision)
+        self.store.intervention_open(
+            task_id=task_id,
+            reason=(f"step '{name}' failed {streak} times in a row "
+                    f"(retry_exhausted -> human required)"),
+            required_action="human review required",
+            last_verified_step=name)
+        return True
+
     def run_task(self, task_id):
         task = self.store.get_task(task_id)
         if not task:
@@ -391,6 +421,11 @@ class AgentRuntime:
                                        current_step=idx)
                 self.journal("TASK_FAILED", task_id=task_id, step=idx,
                              name=step.get("name"))
+                # Phase 56: the same step failing twice in a row escalates
+                # to a human instead of running the matrix recovery again.
+                if self._escalate_repeated_failure(task_id, step):
+                    self.store.release_lease(task_id)
+                    return "FAILED"
                 # Phase 40: escalate recovery for the failed step kind.
                 # The kind is a matrix failure kind ("step_failed"), not the
                 # tool name, so the recovery matrix actually applies.
@@ -405,6 +440,10 @@ class AgentRuntime:
                 self.store.release_lease(task_id)
                 return "FAILED"
             self.recovery.record_success(task_id, step.get("tool", "?"))
+            # a success breaks any consecutive-failure streak for this task
+            self._step_fail_streak = {
+                k: v for k, v in self._step_fail_streak.items()
+                if k[0] != task_id}
             self.store.heartbeat_lease(task_id, f"agent:{self.pid}")
             idx += 1
         self.store.update_task(task_id, status="COMPLETED",
@@ -428,27 +467,38 @@ class AgentRuntime:
 
     def _reconcile_op(self, step):
         """Phase 31: reconcile an UNKNOWN operation against verified state
-        before retrying. Uses the step's idempotent_check as evidence."""
+        before retrying. Uses the step's idempotent_check as evidence.
+
+        Three-valued: True (verified done), False (verified NOT done, based
+        on an actual check), None (no evidence — no idempotent_check to
+        reconcile with; the caller must pause, never guess)."""
         idem = step.get("idempotent_check")
         if not idem:
-            return False, {"reason": "no idempotent_check to reconcile with"}
+            return None, {"reason": "no idempotent_check to reconcile with"}
         v = self.verifier.verify_step({"verify": [idem]})
         return v.passed, {"verdict": v.to_dict()}
 
-    def _classify_error(self, tool, err_text):
+    def _classify_error(self, tool, err_text, exit_code=None):
         """Phase 54: classify a step error deterministically, so the retry
-        loop is governed by the failure kind, not a fixed retry count."""
+        loop is governed by the failure kind, not a fixed retry count.
+
+        Takes the raw tool stderr (not the formatted last_err journal
+        string) plus the tool exit code, so classify_tool_error's patterns
+        and exit-code rules see the real error. The net guard only fires
+        when net.classify actually recognized something ("unknown" means
+        "not a network error", not "retry as network error").
+        """
         from . import model as modelmod
         from . import net as netmod
         text = err_text or ""
         net_kind = netmod.classify(text)
-        if net_kind != "other":
+        if net_kind != "unknown":
             return classifymod.classify("net", net_kind)
         if "malformed" in text.lower() or "schema" in text.lower():
             return classifymod.classify("model", "malformed_response")
         if tool == "browser":
             return classifymod.classify("browser", "page_timeout")
-        return classifymod.classify("tool", "exit_nonzero")
+        return classifymod.classify_tool_error(text, exit_code)
 
     def _run_step(self, task_id, idx, step, task):
         import json
@@ -472,7 +522,10 @@ class AgentRuntime:
             return False
 
         # Phase 60: never let raw secrets into the journal/traces.
-        args = self._resolve_vault_refs(task_id, tool, args)
+        # The resolved raw values come back alongside the args so the
+        # executor can redact them (by value) from the journaled args
+        # and the result streams.
+        args, secret_values = self._resolve_vault_refs(task_id, tool, args)
 
         # Phase 30/31: idempotent operation registry. If this op already
         # COMPLETED, skip it — no duplicate side effects after a crash.
@@ -528,7 +581,20 @@ class AgentRuntime:
                 if not allowed:
                     last_err = f"policy blocked: {reason}"
                     break
-            res = self.ex.run(tool, args=args, task_id=task_id)
+            elif tool in ("write_file", "mkdir"):
+                # Phase 78b: the policy also guards file tools — a step
+                # must not write into the runtime's own state, code,
+                # config, or run trees.
+                allowed, reason = self.policy.authorize_path(
+                    self.cfg.get("base_dir", ""), args.get("path", ""))
+                self.journal("POLICY_CHECK", task_id=task_id, step=idx,
+                             tool=tool, path=args.get("path", ""),
+                             reason=reason)
+                if not allowed:
+                    last_err = f"policy blocked: {reason}"
+                    break
+            res = self.ex.run(tool, args=args, task_id=task_id,
+                              redact_values=secret_values)
             verdict = self.verifier.verify_step(step)
             self.store.update_task(
                 task_id, last_verified_result=json.dumps(verdict.to_dict()))
@@ -552,7 +618,13 @@ class AgentRuntime:
             last_err = (f"tool_ok={res.ok} verify={verdict.passed} "
                         f"stderr={secretsmod.redact_text(res.stderr[:200])}")
             decision, max_retries, base_backoff, c_reason = \
-                self._classify_error(tool, last_err)
+                self._classify_error(tool, res.stderr, res.exit_code)
+            # The step spec may cap retries below the classification
+            # (e.g. retries: 0 for steps that must not loop). The cap is
+            # a ceiling only — it never grants more than the classifier.
+            step_cap = step.get("retries")
+            if step_cap is not None:
+                max_retries = min(max_retries, step_cap)
             self.journal("STEP_CLASSIFICATION", task_id=task_id, step=idx,
                          name=name, decision=decision, reason=c_reason)
             if decision in (classifymod.PERMANENT,
@@ -568,14 +640,18 @@ class AgentRuntime:
             time.sleep(min(base_backoff * (2 ** attempt), 30))
             attempt += 1
 
-        # record failed step
+        # record failed step — re-read the task row first. In a long
+        # task, earlier failures may have updated failed_steps/retry_count
+        # since run_task fetched its snapshot; computing from the stale
+        # dict would overwrite those values.
+        fresh = self.store.get_task(task_id) or {}
         try:
-            failed = json.loads(task.get("failed_steps") or "[]")
+            failed = json.loads(fresh.get("failed_steps") or "[]")
         except Exception:
             failed = []
         failed.append(idx)
         self.store.update_task(task_id, failed_steps=json.dumps(failed),
-                               retry_count=(task.get("retry_count") or 0) + 1)
+                               retry_count=(fresh.get("retry_count") or 0) + 1)
         if op_id:
             self.store.op_set(op_id, task_id, step.get("tool", "shell"),
                               "FAILED", result={"error": last_err})
@@ -601,10 +677,15 @@ class AgentRuntime:
     def _resolve_vault_refs(self, task_id, tool, args):
         """Phase 60: resolve {"vault": "<secret-name>"} args to the raw
         value at execution time only — raw values never persist in step
-        specs, checkpoints, or the journal."""
+        specs, checkpoints, or the journal.
+
+        Returns (resolved_args, secret_values): the substituted raw values
+        so the caller can redact them (by value) from everything journaled
+        — TOOL_STARTED args, last_err, and the tool result's streams."""
         if not isinstance(args, dict):
-            return args
+            return args, []
         resolved = dict(args)
+        secret_values = []
         for k, v in args.items():
             if isinstance(v, dict) and "vault" in v and len(v) == 1:
                 name = v["vault"]
@@ -613,9 +694,10 @@ class AgentRuntime:
                     raise PermissionError(
                         f"vault secret '{name}' not granted to task {task_id}")
                 resolved[k] = val
+                secret_values.append(val)
                 self.journal("VAULT_REF_RESOLVED", task_id=task_id,
                              secret=name)
-        return resolved
+        return resolved, secret_values
 
     def _planner_note_success(self, task_id):
         self.store.world_set(f"planner.fail_streak.{task_id}",
@@ -689,6 +771,13 @@ class AgentRuntime:
                     ("policy", allowed, f"{level}: {reason}"))
                 if not allowed:
                     report["blockers"].append(f"step {idx}: {reason}")
+            elif tool in ("write_file", "mkdir"):
+                ok_p, reason_p = self.policy.authorize_path(
+                    self.cfg.get("base_dir", ""), args.get("path", ""))
+                entry["verdicts"].append(
+                    ("policy", ok_p, f"path: {reason_p}"))
+                if not ok_p:
+                    report["blockers"].append(f"step {idx}: {reason_p}")
             cap_ok, cap_reason = capsmod.check_tool(self.store, task_id, tool)
             entry["verdicts"].append(
                 ("capability", cap_ok, cap_reason))
@@ -776,18 +865,29 @@ class AgentRuntime:
         # 9. exit cleanly (caller returns from serve_forever)
 
     # ---- main loop ----
-    def serve_forever(self):
-        self.install_signal_handlers()
-        self.journal("AGENT_STARTED", pid=self.pid)
-        # Phase 50: local control interface (localhost + token auth)
-        control = None
+    def _start_control(self):
+        """Start the optional local control interface.
+
+        Failures are journaled with the exception type named explicitly
+        (repr alone can hide it) and are never fatal to the agent.
+        Returns the ControlServer, or None if it could not start.
+        """
         try:
             from .remote import ControlServer
             control = ControlServer(self.store, self.cfg,
                                     agent_ref=lambda: self)
             control.start()
+            return control
         except Exception as e:  # noqa: BLE001 - control is optional
-            self.journal("CONTROL_FAILED", error=repr(e))
+            self.journal("CONTROL_FAILED", error_type=type(e).__name__,
+                         error=str(e))
+            return None
+
+    def serve_forever(self):
+        self.install_signal_handlers()
+        self.journal("AGENT_STARTED", pid=self.pid)
+        # Phase 50: local control interface (localhost + token auth)
+        control = self._start_control()
         self.recover()  # reconcile + resume unfinished work on every start
         while not self._shutdown:
             self.beat()
