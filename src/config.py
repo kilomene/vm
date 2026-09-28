@@ -14,6 +14,7 @@ DEFAULTS = {
     "max_restarts_per_hour": 12,
     # Watchdog / hang detection
     "tool_timeout_default_s": 120,
+    "tool_timeout_max_s": 3600,  # absolute upper bound on any tool timeout
     "tool_timeouts": {
         "shell": 120,
         "python": 300,
@@ -48,6 +49,9 @@ DEFAULTS = {
     "escalation_requires_auth": True,   # phase 59: cap escalation needs token
     "clock_drift_warn_s": 60,    # phase 70: warn threshold vs NTP
     "clock_drift_fail_s": 300,   # phase 70: refuse lease validity beyond
+    "clock_fail_threshold": 3,   # consecutive bad clock checks before safe mode
+    "clock_recover_threshold": 3,  # consecutive good checks to auto-clear
+                                   # clock-caused safe mode
     "self_update_enabled": False,  # phase 71-75: opt-in only
     "self_update_allow": [],     # explicit version allowlist; empty=deny
     "fault_injection_enabled": False,  # phase 81: never on in production
