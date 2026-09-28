@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS failure_fingerprints (
     last_seen REAL NOT NULL,
     occurrences INTEGER NOT NULL DEFAULT 1,
     last_method TEXT,
+    operation TEXT,
     escalated INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS resource_owners (
@@ -252,6 +253,11 @@ class Store:
         if "content_sha256" not in scols:
             self._conn.execute(
                 "ALTER TABLE snapshots ADD COLUMN content_sha256 TEXT")
+        fcols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(failure_fingerprints)")}
+        if "operation" not in fcols:
+            self._conn.execute(
+                "ALTER TABLE failure_fingerprints ADD COLUMN operation TEXT")
 
     # ---- tasks ----
     def create_task(self, task_id, spec, working_directory=None):
@@ -682,7 +688,8 @@ class Store:
 
     # ---- recovery attempts + failure fingerprints (phases 55/56) ----
     def recovery_record(self, task_id, failure_kind, signature, method,
-                        level=None, result="ok", detail=None):
+                        level=None, result="ok", detail=None,
+                        operation=None):
         now = time.time()
         with _lock:
             self._conn.execute(
@@ -697,14 +704,17 @@ class Store:
             if row:
                 self._conn.execute(
                     "UPDATE failure_fingerprints SET last_seen=?,"
-                    " occurrences=occurrences+1, last_method=? WHERE signature=?",
-                    (now, method, signature))
+                    " occurrences=occurrences+1, last_method=?,"
+                    " operation=COALESCE(?, operation) WHERE signature=?",
+                    (now, method, operation, signature))
             else:
                 self._conn.execute(
                     "INSERT INTO failure_fingerprints (signature, task_id, kind,"
-                    " first_seen, last_seen, occurrences, last_method)"
-                    " VALUES (?,?,?,?,?,1,?)",
-                    (signature, task_id, failure_kind, now, now, method))
+                    " first_seen, last_seen, occurrences, last_method,"
+                    " operation)"
+                    " VALUES (?,?,?,?,?,1,?,?)",
+                    (signature, task_id, failure_kind, now, now, method,
+                     operation))
             self._conn.commit()
         self.journal("RECOVERY_RECORDED", task_id=task_id,
                      failure=failure_kind, method=method, result=result)
