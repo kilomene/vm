@@ -41,6 +41,8 @@ class Supervisor:
         self._shutdown = False
         self._lock_fh = None
         self._last_progress = {}  # task_id -> (step, ts)
+        self._clock_bad = 0   # consecutive failed clock checks
+        self._clock_good = 0  # consecutive good clock checks
 
     # ---- exclusivity ----
     def acquire_lock(self):
@@ -146,18 +148,70 @@ class Supervisor:
                             "be verified (fail-closed)")
         stale_s = time.time() - hb["ts"]
         if stale_s > self.cfg["heartbeat_timeout_s"]:
-            # stale heartbeat: hang only if also no task progress
+            # stale heartbeat: hang only if also no task progress.
+            # Keep the ORIGINAL first-seen timestamp for an unchanged step
+            # so idle time accumulates across ticks; only (re)baseline when
+            # the step (or task) actually advances. Overwriting the entry
+            # on every tick resets idle_for to ~one tick and hang detection
+            # can never fire.
             tid, step = hb.get("task_id"), hb.get("step")
             key = tid or "__idle__"
             prev = self._last_progress.get(key)
-            self._last_progress[key] = (step, time.time())
-            if prev and prev[0] == step:
-                idle_for = time.time() - prev[1]
-                if idle_for > self.cfg["no_progress_timeout_s"]:
-                    return "hung", (f"heartbeat stale {stale_s:.0f}s, "
-                                    f"no progress for {idle_for:.0f}s")
+            if prev is None or prev[0] != step:
+                self._last_progress[key] = (step, time.time())
+                return "ok", f"heartbeat stale {stale_s:.0f}s but progressing"
+            idle_for = time.time() - prev[1]
+            if idle_for > self.cfg["no_progress_timeout_s"]:
+                return "hung", (f"heartbeat stale {stale_s:.0f}s, "
+                                f"no progress for {idle_for:.0f}s")
             return "ok", f"heartbeat stale {stale_s:.0f}s but progressing"
+        # heartbeat fresh again: drop any accumulated idle baseline so a
+        # recovered agent is not judged by its old stall.
+        self._last_progress.pop(hb.get("task_id") or "__idle__", None)
         return "ok", "healthy"
+
+    # ---- time synchronization (phase 70) ----
+    def _clock_check(self):
+        """One time-sync check with hysteresis.
+
+        A single bad check (e.g. VM suspend/resume, where wall time jumps
+        but monotonic doesn't) must not latch the system in safe mode:
+        safe mode is entered only after clock_fail_threshold consecutive
+        failures, and a clock-caused safe mode auto-clears after
+        clock_recover_threshold consecutive good checks. Escalation-caused
+        safe mode (reason_kind != "clock") is never auto-cleared — only an
+        operator clears it. Returns (ok, detail).
+        """
+        from . import timecheck as timecheckmod
+        clock_ok, clock_detail = timecheckmod.check_sync()
+        self.store.world_set("supervisor.clock", {
+            "ok": clock_ok, "detail": clock_detail,
+            "checked_at": time.time()}, verifier="supervisor:time")
+        if not clock_ok:
+            self._clock_bad += 1
+            self._clock_good = 0
+            self.store.journal("CLOCK_UNRELIABLE", detail=clock_detail,
+                               consecutive=self._clock_bad)
+            if (self._clock_bad >= self.cfg.get("clock_fail_threshold", 3)
+                    and not self.recovery.in_safe_mode()):
+                self.store.journal(
+                    "CLOCK_UNRELIABLE",
+                    detail=clock_detail,
+                    action="safe mode (fail-closed)")
+                self.recovery.enter_safe_mode(
+                    None, f"clock unreliable: {clock_detail}",
+                    reason_kind="clock")
+        else:
+            self._clock_good += 1
+            self._clock_bad = 0
+            sm = self.store.kv_get("safe_mode") or {}
+            if (sm.get("active") and sm.get("reason_kind") == "clock"
+                    and self._clock_good >= self.cfg.get(
+                        "clock_recover_threshold", 3)):
+                self.recovery.exit_safe_mode(
+                    note="clock recovered: auto-cleared clock-caused "
+                         "safe mode")
+        return clock_ok, clock_detail
 
     # ---- main loop ----
     def install_signal_handlers(self):
@@ -186,20 +240,11 @@ class Supervisor:
             state, detail = self.agent_health()
             # Phase 70: time synchronization — fail closed on unreliable
             # clocks, since heartbeats/leases are meaningless without time.
+            # _clock_check applies hysteresis: one blip never latches safe
+            # mode; clock-caused safe mode auto-clears on recovery.
             if time.time() - last_clock_check > 60:
                 last_clock_check = time.time()
-                from . import timecheck as timecheckmod
-                clock_ok, clock_detail = timecheckmod.check_sync()
-                self.store.world_set("supervisor.clock", {
-                    "ok": clock_ok, "detail": clock_detail,
-                    "checked_at": time.time()}, verifier="supervisor:time")
-                if not clock_ok:
-                    self.store.journal(
-                        "CLOCK_UNRELIABLE",
-                        detail=clock_detail,
-                        action="safe mode (fail-closed)")
-                    self.recovery.enter_safe_mode(
-                        None, f"clock unreliable: {clock_detail}")
+                self._clock_check()
             if state == "crashed":
                 self.store.journal("AGENT_CRASHED", detail=detail)
                 if not self.restart_agent(f"crash: {detail}"):
