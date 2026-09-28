@@ -26,6 +26,9 @@ jobs:
           # so invoke via bash explicitly
           VM_AGENT_HOME=/opt/vm-agent bash ./install.sh
 
+      - name: Install test deps
+        run: python3 -m pip install pytest
+
       - name: Run test suite
         run: |
           export VM_AGENT_HOME=/opt/vm-agent
