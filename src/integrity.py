@@ -11,16 +11,20 @@ import hashlib
 import os
 
 # Paths that are integrity-tracked by default (relative to base_dir).
+# NOTE: state/state.db is deliberately NOT tracked — a live SQLite file
+# changes on every write and would always report "modified". The systemd
+# unit is not tracked either: install.sh writes it to /etc/systemd/system
+# (or skips it), never under the install prefix, so the relative path was
+# bogus and could never match.
 TRACKED = [
     "config/config.json",
-    "systemd/vm-agent.service",
-    "state/state.db",
 ]
 
 # Config files the agent may not modify without an auth token.
+# (The systemd unit is not installed under the prefix, so it is not
+# listed here — it was a stale path that matched nothing.)
 PROTECTED_CONFIG = [
     "config/config.json",
-    "systemd/vm-agent.service",
 ]
 
 
@@ -42,6 +46,32 @@ def record(store, base_dir, paths=None):
             store.hash_record(full, digest)
             out[full] = digest
     store.journal("INTEGRITY_RECORDED", files=list(out))
+    return out
+
+
+def recorded_count(store, base_dir, paths=None):
+    """How many TRACKED files have a recorded baseline hash."""
+    n = 0
+    for rel in (paths or TRACKED):
+        full = os.path.join(base_dir, rel)
+        if os.path.exists(full) and store.hash_get(full) is not None:
+            n += 1
+    return n
+
+
+def ensure_baseline(store, base_dir, paths=None):
+    """Record a baseline for TRACKED files if none exists yet.
+
+    Called at install time and on first supervisor start: verify() skips
+    files with no recorded hash, so without a baseline the integrity
+    check is vacuous ("clean" with nothing compared). Returns the
+    recorded {path: sha256} (empty when a baseline already existed).
+    """
+    if recorded_count(store, base_dir, paths) > 0:
+        return {}
+    out = record(store, base_dir, paths)
+    if out:
+        store.journal("INTEGRITY_BASELINE_RECORDED", files=list(out))
     return out
 
 
@@ -86,7 +116,10 @@ def authorize_config_write(path, auth_token=None):
 # ---- Phase 61: configuration versioning and restoration ----
 def snapshot_config(store, base_dir, paths=None, note=""):
     """Version the current config files (content stored, not just hashes).
-    Call after any authorized config change. Returns version ids."""
+    Call after any authorized config change. Returns version ids.
+
+    Re-records the integrity baseline for the versioned files: an
+    authorized change is the new trusted state, not tamper."""
     import time
     vids = []
     for rel in (paths or PROTECTED_CONFIG):
@@ -97,6 +130,7 @@ def snapshot_config(store, base_dir, paths=None, note=""):
             content = f.read()
         vid = store.config_version_save(full, content, note=note)
         vids.append((rel, vid))
+        store.hash_record(full, sha256_file(full))
     if vids:
         store.journal("CONFIG_VERSIONED", versions=[v[1] for v in vids],
                       note=note)
