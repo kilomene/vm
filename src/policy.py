@@ -15,16 +15,31 @@ features cannot be disabled; recovery mechanisms cannot be exploited to
 perform unauthorized actions (e.g. granting oneself capabilities through the
 DB, or invoking recovery tooling to bypass policy).
 """
+import os
 import re
 
 PROTECTED_PATTERNS = [
-    # Match as actual commands (start of string or after shell operators),
-    # not as substrings inside file paths.
-    r"(^|[;&|]\s*|\bsudo\s+)shutdown\b", r"(^|[;&|]\s*|\bsudo\s+)reboot\b",
-    r"(^|[;&|]\s*|\bsudo\s+)halt\b", r"(^|[;&|]\s*|\bsudo\s+)poweroff\b",
-    r"systemctl\s+(disable|stop|mask)\s+vm-agent",
+    # Power actions as actual commands (start of string or after shell
+    # operators, quotes, or newlines — not substrings inside paths).
+    # Covers: shutdown, /sbin/shutdown -h now, sudo /sbin/reboot,
+    # env shutdown now, (shutdown now), bash -c 'shutdown now',
+    # newline-separated commands.
+    r"(^|[;&|(\n'\"]\s*|\bsudo\s+|\benv\s+)"
+    r"(\S*/)?(shutdown|reboot|halt|poweroff)\b",
+    # systemctl power actions and killing/disabling our own unit
+    r"systemctl\s+(poweroff|reboot|halt|kill)\b",
+    r"systemctl\s+(disable|stop|mask|kill)\s+vm-agent",
+    # classic init runlevels
+    r"(^|[;&|(\n]\s*|\bsudo\s+)\binit\s+[06]\b",
     r"rm\s+.*state\.db", r"rm\s+-rf?\s+.*vm-agent/state",
     r"rm\s+-rf?\s+.*vm-agent/checkpoints",
+    # state/db destruction beyond rm
+    r"\bfind\b.*vm-agent/state\b.*-delete\b",
+    r"\bmv\b.*vm-agent/state\b",
+    r"\btruncate\b.*state\.db",
+    # writes to the installed policy source itself
+    r"(^|[;&|]\s*)(sed|ed|tee|printf|echo)\b.*lib/vmagent/policy\.py",
+    r">\s*.*lib/vmagent/policy\.py",
     r"kill.*supervisor",
 ]
 
@@ -98,4 +113,29 @@ class Policy:
             return False, f"PROTECTED operation refused: {command[:80]}"
         if level == "RESTRICTED":
             return True, "RESTRICTED — executed with audit log entry"
+        return True, "SAFE"
+
+    def authorize_path(self, base_dir, path):
+        """Policy for the write_file/mkdir tools: refuse paths under the
+        install prefix's protected trees (state, lib/vmagent, config,
+        run). The path is resolved with os.path.realpath first, so
+        symlinks and '..' traversals cannot escape the check. Relative
+        paths are evaluated against both the process cwd and base_dir.
+        Returns (allowed: bool, reason: str)."""
+        if not path:
+            return True, "no path"
+        base = os.path.realpath(base_dir) if base_dir else ""
+        if not base:
+            return True, "no base_dir to evaluate against"
+        protected = [os.path.join(base, d)
+                     for d in ("state", "lib/vmagent", "config", "run")]
+        candidates = [os.path.realpath(path)]
+        if not os.path.isabs(path):
+            candidates.append(os.path.realpath(os.path.join(base, path)))
+        for full in candidates:
+            for pdir in protected:
+                if full == pdir or full.startswith(pdir + os.sep):
+                    return False, (
+                        f"PROTECTED path refused: {path} "
+                        f"(under {os.path.relpath(pdir, base)})")
         return True, "SAFE"
