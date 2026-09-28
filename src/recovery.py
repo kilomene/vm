@@ -144,7 +144,8 @@ class RecoveryManager:
         # 4. persist the attempt (phase 55)
         self.store.recovery_record(task_id, kind, sig, action, level=level,
                                    result="ok" if level < 8 else "failed",
-                                   detail=str(detail)[:300])
+                                   detail=str(detail)[:300],
+                                   operation=operation or kind)
         # 5. explain the recovery (phase 88: recovery communication)
         self._explain(task_id, kind, action, level, sig, detail)
         if level >= 7:
@@ -173,10 +174,15 @@ class RecoveryManager:
                                 else "resume on success"))
 
     # ---- safe mode (phase 41) ----
-    def enter_safe_mode(self, task_id=None, reason=""):
+    def enter_safe_mode(self, task_id=None, reason="", reason_kind=None):
+        """reason_kind tags the cause: "clock" for clock-caused safe mode
+        (auto-clears when the clock recovers); anything else (escalation)
+        is never auto-cleared — only an operator clears it."""
         self.store.kv_set("safe_mode", {"active": True, "ts": time.time(),
-                                        "reason": reason, "task_id": task_id})
-        self.journal("SAFE_MODE_ENTERED", task_id=task_id, reason=reason)
+                                        "reason": reason, "task_id": task_id,
+                                        "reason_kind": reason_kind})
+        self.journal("SAFE_MODE_ENTERED", task_id=task_id, reason=reason,
+                     reason_kind=reason_kind)
 
     def exit_safe_mode(self, note=""):
         self.store.kv_set("safe_mode", {"active": False, "ts": time.time(),
@@ -199,27 +205,41 @@ class RecoveryManager:
             report["fixed"].append(f"reaped stale locks: {reaped}")
 
         # 2. expired leases held by dead workers -> release
-        with_dead = []
-        for task in self.store.list_tasks():
-            # leases table scan via direct query
-            pass  # handled below via store internals
         report["fixed"].extend(self._reap_dead_leases())
 
-        # 3. tasks stuck RUNNING from a dead agent -> mark for resume
+        # 3. tasks stuck RUNNING from a dead agent -> re-queue as PENDING
+        # so they resume from checkpoint. Their leases are released too
+        # (they may not be expired yet), so a later run_task's
+        # claim_lease can succeed. No double-run risk: recover() only
+        # resumes RUNNING/PAUSED tasks while serve_forever only picks up
+        # PENDING ones, and both paths funnel through claim_lease.
         agent_hb = self.store.get_heartbeat("agent")
         agent_alive = agent_hb and _pid_alive(agent_hb.get("pid") or 0)
-        for t in self.store.list_tasks(status="RUNNING"):
-            if not agent_alive:
-                report["warnings"].append(
-                    f"task {t['task_id']} was RUNNING with no live agent;"
-                    " will resume from checkpoint")
+        if not agent_alive:
+            for t in self.store.list_tasks(status="RUNNING"):
+                tid = t["task_id"]
+                self.store.update_task(tid, status="PENDING")
+                self.store.release_lease(tid)
+                self.journal("TASK_REQUEUED_ON_BOOT", task_id=tid)
+                report["fixed"].append(
+                    f"task {tid} was RUNNING with no live agent;"
+                    " re-queued as PENDING")
 
-        # 4. file integrity on tracked files
+        # 4. file integrity on tracked files. Record a baseline first if
+        # none exists (install-time/first-start); a verify with no
+        # baseline compares nothing, so report that honestly instead of
+        # claiming "clean".
+        integ.ensure_baseline(self.store, ctx.get("base_dir", "/tmp"))
         bad = integ.verify(self.store, ctx.get("base_dir", "/tmp"))
         if bad:
             report["warnings"].append(f"integrity mismatches: {bad}")
         else:
-            report["fixed"].append("integrity check clean")
+            n = integ.recorded_count(self.store, ctx.get("base_dir", "/tmp"))
+            if n:
+                report["fixed"].append(
+                    f"integrity check clean (verified {n} files)")
+            else:
+                report["warnings"].append("no integrity baseline recorded")
 
         # 5. dependency check
         dep_results = depsmod.check_all(self.store, ctx)
