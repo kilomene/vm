@@ -63,6 +63,11 @@ class TxnRunner:
                 done, evidence = reconcile_fn()
                 self.journal("OP_RECONCILED", op_id=op_id, done=done,
                              evidence=evidence)
+                if done is None:
+                    # No evidence either way (e.g. no idempotent_check):
+                    # ambiguous — never guess. Pause for human review.
+                    return False, ("ambiguous: no way to verify whether the"
+                                   " op completed; paused for human review")
                 if done:
                     self.store.op_set(op_id, rec.get("task_id"), rec["kind"],
                                       "COMPLETED", result={"reconciled": True})
