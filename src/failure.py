@@ -110,5 +110,6 @@ def record(store, task_id, failure_kind, operation, method,
     Returns the failure signature."""
     sig = fingerprint(failure_kind, operation, error_text)
     store.recovery_record(task_id, failure_kind, sig, method,
-                          level=level, result=result, detail=detail)
+                          level=level, result=result, detail=detail,
+                          operation=operation)
     return sig
