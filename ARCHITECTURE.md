@@ -41,10 +41,17 @@ by the verifier path.
 
 ### 5. Policy layer (`lib/vmagent/policy.py`)
 Classifies shell commands: SAFE / RESTRICTED (logged) / PROTECTED (refused).
-Protected: shutdown/reboot/halt/poweroff as commands, disabling the
+Protected: shutdown/reboot/halt/poweroff as commands (including
+path-qualified, `env`-wrapped, and subshell forms), disabling the
 vm-agent unit, deleting state/journal/checkpoints, killing the supervisor.
 The runtime refuses PROTECTED without an out-of-band token (not implemented
 to auto-approve — refusal is the safe default).
+
+This policy is a best-effort guardrail against *accidental* damage by a
+cooperating agent, not a security boundary against a hostile one: it is
+regex matching on shell strings, and regex cannot sandbox a shell. The
+real security boundary is the OS user the service runs as (plus the
+systemd hardening that is present: `NoNewPrivileges`, `PrivateTmp`).
 
 ### 6. State (`lib/vmagent/state.py`)
 SQLite tables: `tasks`, `checkpoints`, `heartbeats`, `kv`,
@@ -59,7 +66,7 @@ Thread-safe via an RLock (journal is called from lock-holding methods).
 
 ### 7. CLI (`lib/vmagent/cli.py`)
 `vm-agent status|health|logs|tasks|submit|restart|diagnostics|diagnose|
-recover|locks|interventions|world|task-pause|task-resume|task-cancel`.
+recover|locks|interventions|world|task-pause|task-resume|task-retry|task-cancel`.
 
 ### 8. Reliability layer (phases 26–60)
 - `deps.py` — dependency self-checks + safe-repair-only healing (26)
