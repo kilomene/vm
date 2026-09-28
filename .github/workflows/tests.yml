@@ -22,7 +22,9 @@ jobs:
         run: |
           sudo mkdir -p /opt/vm-agent
           sudo chown "$USER:$USER" /opt/vm-agent
-          VM_AGENT_HOME=/opt/vm-agent ./install.sh
+          # note: files pushed via the GitHub contents API lose the +x bit,
+          # so invoke via bash explicitly
+          VM_AGENT_HOME=/opt/vm-agent bash ./install.sh
 
       - name: Run test suite
         run: |
