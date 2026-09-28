@@ -30,6 +30,7 @@ vm-agent interventions       # open human interventions
 vm-agent world               # verified world state
 vm-agent task-pause <id>     # pause a task (step boundary)
 vm-agent task-resume <id>    # re-queue a paused/failed task
+vm-agent task-retry <id> --from-step N  # re-queue from 1-based step N
 vm-agent task-cancel <id>    # state-aware cancel (checkpoint, then stop)
 ```
 
