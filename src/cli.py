@@ -137,6 +137,23 @@ def cmd_task_op(args):
     s.close()
 
 
+def cmd_task_retry(args):
+    """task-retry: reset a task to PENDING and rewind it to a 1-based step
+    number. --from-step N re-runs step N, so current_step (the count of
+    completed steps) is set to N-1, clamped to >= 0."""
+    s = _store(_cfg())
+    task = s.get_task(args.task_id)
+    if not task:
+        print(f"unknown task {args.task_id}")
+        s.close()
+        return
+    from_step = max(0, (args.from_step or 1) - 1)
+    s.update_task(args.task_id, status="PENDING", current_step=from_step)
+    s.journal("TASK_RETRY_CLI", task_id=args.task_id, from_step=from_step)
+    print(f"{args.task_id}: retry from step {from_step + 1} requested")
+    s.close()
+
+
 def cmd_submit(args):
     import uuid
     cfg = _cfg()
@@ -343,16 +360,20 @@ def cmd_recover(args):
                       "checkpoint")
                 continue
             for fs in sigs[:3]:
+                kind = fs["kind"]
                 method, sig, exhausted = analyzer.choose_strategy(
-                    tid, fs["failure_kind"], fs["operation"], "")
-                entry = matrixmod.policy_for(fs["failure_kind"])
-                print(f"    failure '{fs['failure_kind']}' "
+                    tid, kind, fs.get("operation") or kind, "")
+                entry = matrixmod.policy_for(kind)
+                print(f"    failure '{kind}' "
                       f"(x{fs['occurrences']}):")
                 print(f"      matrix: {entry['detection']} -> "
                       f"{entry['recovery']} -> {entry['verification']}")
-                print(f"      history: {fs['last_strategy']} tried "
+                last = fs.get("last_method") or "none"
+                print(f"      history: {last} tried "
                       f"{fs['occurrences']}x, "
                       f"{'EXHAUSTED -> escalate to ' + entry['escalation'] if exhausted else 'would try: ' + method}")
+                if fs.get("operation"):
+                    print(f"      operation: {fs['operation']}")
         s.close()
         return
     running = [t for t in s.list_tasks() if t["status"] in ("RUNNING", "PAUSED")]
@@ -363,6 +384,30 @@ def cmd_recover(args):
               f"last checkpoint: {ck['label'] if ck else 'none'}")
     print("unfinished tasks resume automatically when the agent (re)starts.")
     s.close()
+
+
+def cmd_safe_mode(args):
+    """safe-mode status | safe-mode exit [--note TEXT].
+
+    RECOVERY.md promises "an operator clears it" — this is the operator's
+    handle. exit clears any safe mode (escalation- or clock-caused);
+    clock-caused safe mode also auto-clears when the clock recovers."""
+    from .recovery import RecoveryManager
+    cfg = _cfg()
+    s = _store(cfg)
+    rec = RecoveryManager(s, cfg, journal=s.journal)
+    try:
+        if args.safe_mode_cmd == "status":
+            sm = s.kv_get("safe_mode") or {}
+            print(json.dumps(sm, indent=2, default=str))
+        elif args.safe_mode_cmd == "exit":
+            if not rec.in_safe_mode():
+                print("safe mode is not active; nothing to clear")
+            else:
+                rec.exit_safe_mode(note=getattr(args, "note", "") or "")
+                print("safe mode cleared")
+    finally:
+        s.close()
 
 
 def cmd_matrix(args):
@@ -450,6 +495,11 @@ def main():
         p = sub.add_parser(f"task-{op}")
         p.add_argument("task_id")
         p.set_defaults(fn=cmd_task_op, op=op)
+    p = sub.add_parser("task-retry")
+    p.add_argument("task_id")
+    p.add_argument("--from-step", type=int, default=1,
+                   help="1-based step number to restart from")
+    p.set_defaults(fn=cmd_task_retry)
     sub.add_parser("restart").set_defaults(fn=cmd_restart)
     sub.add_parser("diagnose").set_defaults(fn=cmd_diagnose)
     sub.add_parser("diagnostics").set_defaults(fn=cmd_diagnostics)
@@ -463,6 +513,15 @@ def main():
     p = sub.add_parser("matrix")
     p.add_argument("--kind", default=None)
     p.set_defaults(fn=cmd_matrix)
+    p = sub.add_parser("safe-mode", help="inspect/clear safe mode")
+    sp = p.add_subparsers(dest="safe_mode_cmd", required=True)
+    sp.add_parser("status", help="show the safe-mode record"
+                  ).set_defaults(fn=cmd_safe_mode)
+    pe = sp.add_parser("exit", help="clear safe mode (operator action)")
+    pe.add_argument("--note", default="",
+                    help="operator note recorded with the clear")
+    pe.set_defaults(fn=cmd_safe_mode)
+    p.set_defaults(fn=cmd_safe_mode)
     p = sub.add_parser("dry-run")
     p.add_argument("task", help="task_id to simulate")
     p.set_defaults(fn=cmd_dry_run)
