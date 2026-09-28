@@ -23,16 +23,37 @@ def _token_path(base_dir):
 
 
 def ensure_token(base_dir):
-    """Create the control token once (0600); return it."""
+    """Create the control token once; return it.
+
+    The file is created atomically with mode 0600 via os.open with
+    O_CREAT|O_EXCL: there is no 0644 window between creation and chmod
+    (the old code created with the default umask and chmod'd after).
+    If the token already exists, it is read back, never replaced.
+    run/ is created (or tightened) to 0700.
+    """
     path = _token_path(base_dir)
-    if os.path.exists(path):
+    run_dir = os.path.dirname(path)
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(run_dir, 0o700)
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
         with open(path) as f:
             return f.read().strip()
-    token = secrets.token_urlsafe(32)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(token)
-    os.chmod(path, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+    except BaseException:
+        # don't leave a half-written token behind for a retry to read
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     return token
 
 
