@@ -264,7 +264,7 @@ def cmd_diagnose(args):
     print(f"Recent recovery attempts: {len(recs)} shown (of history)")
     for r in recs:
         print(f"  {r['task_id']}: {r['failure_kind']} -> "
-              f"{r['strategy']} = {r['result']}")
+              f"{r['recovery_method']} = {r['result']}")
     n_sigs = sum(len(s.failure_signatures(t["task_id"])) for t in tasks)
     print(f"Failure fingerprints tracked: {n_sigs}")
     n_proven = sum(1 for b in s.backups_list() if b["restored_ok"])
