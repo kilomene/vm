@@ -107,8 +107,30 @@ if [ "$SYSTEMD_UNIT" = "system" ]; then
   sleep 3
 else
   echo "--- starting supervisor directly (no persistent systemd) ---"
-  # kill any stale supervisor first (idempotent)
-  pkill -f "vmagent.supervisor" 2>/dev/null || true
+  # Stop only this prefix's old supervisor. A process with the same module
+  # name may serve another install; a stale PID file may point at anything.
+  PID_FILE="$PREFIX/run/supervisor.pid"
+  if [ -f "$PID_FILE" ]; then
+    OLD_PID="$(cat "$PID_FILE")"
+    if [[ "$OLD_PID" =~ ^[0-9]+$ ]] && [ -r "/proc/$OLD_PID/environ" ] && \
+       [ -r "/proc/$OLD_PID/cmdline" ]; then
+      if tr '\0' '\n' < "/proc/$OLD_PID/environ" | grep -Fxq "VM_AGENT_HOME=$PREFIX"; then
+        if tr '\0' '\n' < "/proc/$OLD_PID/cmdline" | grep -Fxq 'vmagent.supervisor'; then
+          kill "$OLD_PID" 2>/dev/null || true
+          # The old supervisor stops its agent and releases its lock asynchronously.
+          # Do not launch a replacement until it has fully exited.
+          for _i in $(seq 1 30); do
+            kill -0 "$OLD_PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "FATAL: old supervisor $OLD_PID did not stop" >&2
+            exit 1
+          fi
+        fi
+      fi
+    fi
+  fi
   sleep 1
   nohup "$PREFIX/scripts/boot.sh" > "$PREFIX/logs/supervisor.out" 2>&1 &
   sleep 3
